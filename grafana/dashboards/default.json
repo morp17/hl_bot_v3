@@ -1,0 +1,56 @@
+{
+  "title": "Hyperliquid Bot Dashboard",
+  "uid": "hl-bot-dashboard",
+  "version": 1,
+  "panels": [
+    {
+      "title": "Balance",
+      "type": "graph",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "bot_balance",
+          "legendFormat": "Balance"
+        }
+      ]
+    },
+    {
+      "title": "PnL Today",
+      "type": "graph",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "bot_pnl_today",
+          "legendFormat": "PnL"
+        }
+      ]
+    },
+    {
+      "title": "Open Positions",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "bot_open_positions",
+          "legendFormat": "Positions"
+        }
+      ]
+    },
+    {
+      "title": "Drawdown",
+      "type": "graph",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        {
+          "expr": "bot_drawdown_pct",
+          "legendFormat": "Drawdown %"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 27,
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "tags": ["hyperliquid", "bot", "trading"],
+  "timezone": "America/Sao_Paulo"
+}

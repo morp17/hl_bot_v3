@@ -1,0 +1,95 @@
+# ============================================================
+# Hyperliquid Production Bot v3.0 — Docker Compose
+# ============================================================
+# Uso:
+#   docker compose up -d              # Inicia todos os serviços
+#   docker compose up -d bot          # Apenas o bot
+#   docker compose logs -f bot        # Logs em tempo real
+# ============================================================
+
+services:
+  # --- Bot Principal ---
+  bot:
+    build: .
+    container_name: hl-bot-v3
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"   # Dashboard
+      - "9090:9090"   # Prometheus metrics
+      - "8081:8081"   # Health check
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./bot_config.json:/app/bot_config.json
+    depends_on:
+      - prometheus
+    networks:
+      - hl-network
+    command: python main.py
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'python main.py' || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+
+  # --- Prometheus (Métricas) ---
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: hl-prometheus
+    restart: unless-stopped
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+    networks:
+      - hl-network
+
+  # --- Grafana (Dashboards Visuais) ---
+  grafana:
+    image: grafana/grafana:latest
+    container_name: hl-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_INSTALL_PLUGINS=
+    depends_on:
+      - prometheus
+    networks:
+      - hl-network
+
+volumes:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  hl-network:
+    driver: bridge

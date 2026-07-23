@@ -1,0 +1,43 @@
+# Hyperliquid Production Bot v3.0
+# Core
+hyperliquid-python-sdk>=0.6.0
+ccxt>=4.4.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# Data & Analysis
+pandas>=2.1.0
+numpy>=1.26.0
+ta>=0.11.0  # Technical Analysis Library
+
+# Async & Web
+httpx>=0.26.0
+websockets>=12.0
+aiohttp>=3.9.0
+
+# Dashboard
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+jinja2>=3.1.0
+python-multipart>=0.0.6
+aiofiles>=23.2.0
+
+# Monitoring
+prometheus-client>=0.19.0
+psutil>=5.9.0
+
+# Notifications
+telegram>=0.0.1  # python-telegram-bot
+discord.py>=2.3.0
+aiofiles>=23.2.0
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0
+pytest-mock>=3.12.0
+
+# Dev
+python-dotenv>=1.0.0
+rich>=13.7.0
+loguru>=0.7.2

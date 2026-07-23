@@ -1,0 +1,503 @@
+"""
+Testes do Módulo de Risco — Hyperliquid Production Bot v3.0
+============================================================
+Testa PositionManager, cálculo de stops, sizing e filtros.
+
+Requisitos:
+- Type hints
+- Tratamento de exceções
+- Validação de inputs
+- Logs estruturados
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Any, Dict
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from crypto_bot_core.risk import (
+    LIQUIDATION_SAFETY_BUFFER_PCT,
+    CHECK_EXITS_MISS_THRESHOLD,
+    Position,
+    PositionManager,
+    calc_position_size,
+    calc_stops,
+    trade_hours_ok,
+)
+
+
+# ──────────────────────────────────────────────
+# Fixtures
+# ──────────────────────────────────────────────
+
+
+@pytest.fixture
+def sample_df() -> pd.DataFrame:
+    """DataFrame com dados OHLCV para testes de SL estrutural."""
+    np.random.seed(42)
+    n = 50
+    close = np.random.randn(n).cumsum() + 100
+    return pd.DataFrame(
+        {
+            "close": close,
+            "high": close + np.random.rand(n) * 2,
+            "low": close - np.random.rand(n) * 2,
+            "volume": np.random.rand(n) * 1000,
+        }
+    )
+
+
+@pytest.fixture
+def pm() -> PositionManager:
+    """PositionManager com configuração padrão."""
+    return PositionManager(
+        capital_usd=10000.0,
+        max_open_trades=3,
+        max_drawdown_pct=0.20,
+        daily_loss_limit_pct=0.10,
+        max_consecutive_losses=5,
+        cooldown_after_loss_sec=300,
+    )
+
+
+@pytest.fixture
+def sample_position() -> Position:
+    """Posição de exemplo."""
+    return Position(
+        symbol="BTC/USDC",
+        side="buy",
+        entry_price=50000.0,
+        qty=0.1,
+        stop_loss=49000.0,
+        take_profit=52000.0,
+        open_time=time.time(),
+    )
+
+
+# ──────────────────────────────────────────────
+# Testes: Position (dataclass)
+# ──────────────────────────────────────────────
+
+
+class TestPosition:
+    """Testes para a dataclass Position."""
+
+    def test_valid_position(self) -> None:
+        """Deve criar posição válida."""
+        pos = Position(symbol="ETH/USDC", side="sell", entry_price=3000.0, qty=1.0)
+        assert pos.symbol == "ETH/USDC"
+        assert pos.side == "sell"
+        assert pos.entry_price == 3000.0
+        assert pos.qty == 1.0
+
+    def test_invalid_side(self) -> None:
+        """Deve rejeitar side inválido."""
+        with pytest.raises(ValueError, match="side inválido"):
+            Position(symbol="BTC/USDC", side="hold", entry_price=50000.0, qty=0.1)
+
+    def test_zero_qty(self) -> None:
+        """Deve rejeitar qty zero."""
+        with pytest.raises(ValueError, match="qty deve ser > 0"):
+            Position(symbol="BTC/USDC", side="buy", entry_price=50000.0, qty=0)
+
+    def test_negative_qty(self) -> None:
+        """Deve rejeitar qty negativa."""
+        with pytest.raises(ValueError, match="qty deve ser > 0"):
+            Position(symbol="BTC/USDC", side="buy", entry_price=50000.0, qty=-1)
+
+    def test_zero_entry_price(self) -> None:
+        """Deve rejeitar entry_price zero."""
+        with pytest.raises(ValueError, match="entry_price deve ser > 0"):
+            Position(symbol="BTC/USDC", side="buy", entry_price=0, qty=0.1)
+
+
+# ──────────────────────────────────────────────
+# Testes: calc_position_size
+# ──────────────────────────────────────────────
+
+
+class TestCalcPositionSize:
+    """Testes para calc_position_size."""
+
+    def test_basic_sizing(self) -> None:
+        """Deve calcular tamanho básico."""
+        qty = calc_position_size(balance=10000, price=50000, atr=1000, risk_per_trade=0.02)
+        # risk_amt = 10000 * 0.02 = 200
+        # stop_dist = max(1000*2, 50000*0.001) = max(2000, 50) = 2000
+        # qty_risk = 200 / 2000 = 0.1
+        # max_qty = (10000 * 0.20) / 50000 = 0.04
+        # qty = min(0.1, 0.04) = 0.04
+        assert qty == 0.04
+
+    def test_zero_balance(self) -> None:
+        """Deve retornar 0 para saldo zero."""
+        assert calc_position_size(balance=0, price=50000, atr=1000) == 0.0
+
+    def test_zero_price(self) -> None:
+        """Deve retornar 0 para preço zero."""
+        assert calc_position_size(balance=10000, price=0, atr=1000) == 0.0
+
+    def test_negative_balance(self) -> None:
+        """Deve retornar 0 para saldo negativo."""
+        assert calc_position_size(balance=-100, price=50000, atr=1000) == 0.0
+
+    def test_custom_risk(self) -> None:
+        """Deve usar risk_per_trade personalizado."""
+        qty = calc_position_size(
+            balance=10000, price=50000, atr=1000, risk_per_trade=0.05
+        )
+        # risk_amt = 10000 * 0.05 = 500
+        # stop_dist = 2000
+        # qty_risk = 500 / 2000 = 0.25
+        # max_qty = 0.04
+        # qty = min(0.25, 0.04) = 0.04
+        assert qty == 0.04
+
+    def test_small_atr(self) -> None:
+        """Deve usar price*0.001 quando ATR é muito pequeno."""
+        qty = calc_position_size(balance=10000, price=50000, atr=1, risk_per_trade=0.02)
+        # stop_dist = max(2, 50) = 50
+        # qty_risk = 200 / 50 = 4.0
+        # max_qty = 0.04
+        # qty = min(4.0, 0.04) = 0.04
+        assert qty == 0.04
+
+
+# ──────────────────────────────────────────────
+# Testes: calc_stops
+# ──────────────────────────────────────────────
+
+
+class TestCalcStops:
+    """Testes para calc_stops."""
+
+    def test_buy_stops(self) -> None:
+        """Deve calcular SL e TP para compra."""
+        sl, tp = calc_stops(price=50000, side="buy", atr=1000)
+        # sl_pct = 50000 * 0.02 = 1000
+        # sl_atr = 1000 * 2 = 2000
+        # sl_d = max(1000, 2000) = 2000
+        # tp_d = max(50000*0.04, 1000*4) = max(2000, 4000) = 4000
+        # sl = 50000 - 2000 = 48000
+        # tp = 50000 + 4000 = 54000
+        assert sl == 48000.0
+        assert tp == 54000.0
+
+    def test_sell_stops(self) -> None:
+        """Deve calcular SL e TP para venda."""
+        sl, tp = calc_stops(price=50000, side="sell", atr=1000)
+        # sl = 50000 + 2000 = 52000
+        # tp = 50000 - 4000 = 46000
+        assert sl == 52000.0
+        assert tp == 46000.0
+
+    def test_zero_price(self) -> None:
+        """Deve retornar (0, 0) para preço zero."""
+        sl, tp = calc_stops(price=0, side="buy", atr=1000)
+        assert sl == 0.0
+        assert tp == 0.0
+
+    def test_invalid_side(self) -> None:
+        """Deve retornar (0, 0) para side inválido."""
+        sl, tp = calc_stops(price=50000, side="invalid", atr=1000)
+        assert sl == 0.0
+        assert tp == 0.0
+
+    def test_custom_pcts(self) -> None:
+        """Deve usar percentuais personalizados."""
+        sl, tp = calc_stops(
+            price=50000, side="buy", atr=1000,
+            stop_loss_pct=0.01, take_profit_pct=0.02,
+        )
+        # sl_pct = 50000 * 0.01 = 500
+        # sl_atr = 2000
+        # sl_d = max(500, 2000) = 2000
+        # tp_d = max(50000*0.02, 4000) = max(1000, 4000) = 4000
+        assert sl == 48000.0
+        assert tp == 54000.0
+
+    def test_structural_sl(self, sample_df: pd.DataFrame) -> None:
+        """Deve usar SL estrutural quando df é fornecido."""
+        sl, tp = calc_stops(
+            price=100, side="buy", atr=2,
+            df=sample_df,
+        )
+        # Deve retornar valores válidos
+        assert sl > 0
+        assert tp > 0
+        assert sl < 100  # SL abaixo do preço para compra
+        assert tp > 100  # TP acima do preço para compra
+
+
+# ──────────────────────────────────────────────
+# Testes: trade_hours_ok
+# ──────────────────────────────────────────────
+
+
+class TestTradeHoursOk:
+    """Testes para trade_hours_ok."""
+
+    def test_no_filter(self) -> None:
+        """Deve retornar True sem filtro de horário."""
+        assert trade_hours_ok(0, 0) is True
+
+    def test_within_hours(self) -> None:
+        """Deve retornar True dentro do horário (simulado)."""
+        with patch("crypto_bot_core.risk.datetime") as mock_dt:
+            mock_dt.now.return_value.hour = 14
+            mock_dt.now.return_value.strftime.return_value = "2024-01-01"
+            assert trade_hours_ok(8, 22) is True
+
+    def test_outside_hours(self) -> None:
+        """Deve retornar False fora do horário."""
+        with patch("crypto_bot_core.risk.datetime") as mock_dt:
+            mock_dt.now.return_value.hour = 6
+            mock_dt.now.return_value.strftime.return_value = "2024-01-01"
+            assert trade_hours_ok(8, 22) is False
+
+    def test_overnight_within(self) -> None:
+        """Deve funcionar com janela que passa da meia-noite."""
+        with patch("crypto_bot_core.risk.datetime") as mock_dt:
+            mock_dt.now.return_value.hour = 22
+            mock_dt.now.return_value.strftime.return_value = "2024-01-01"
+            assert trade_hours_ok(20, 6) is True  # 22h está dentro de 20-6
+
+    def test_overnight_outside(self) -> None:
+        """Deve retornar False fora da janela noturna."""
+        with patch("crypto_bot_core.risk.datetime") as mock_dt:
+            mock_dt.now.return_value.hour = 12
+            mock_dt.now.return_value.strftime.return_value = "2024-01-01"
+            assert trade_hours_ok(20, 6) is False  # 12h está fora de 20-6
+
+
+# ──────────────────────────────────────────────
+# Testes: PositionManager
+# ──────────────────────────────────────────────
+
+
+class TestPositionManagerInit:
+    """Testes de inicialização do PositionManager."""
+
+    def test_init_defaults(self) -> None:
+        """Deve inicializar com valores padrão."""
+        pm = PositionManager(capital_usd=10000)
+        assert pm.current_balance == 10000.0
+        assert pm.peak_balance == 10000.0
+        assert pm.pnl_today == 0.0
+        assert pm.consecutive_losses == 0
+        assert pm.positions == []
+
+    def test_init_custom(self) -> None:
+        """Deve inicializar com valores personalizados."""
+        pm = PositionManager(
+            capital_usd=50000,
+            max_open_trades=5,
+            max_drawdown_pct=0.30,
+            daily_loss_limit_pct=0.15,
+        )
+        assert pm.current_balance == 50000.0
+        assert pm.max_open_trades == 5
+        assert pm.max_drawdown_pct == 0.30
+        assert pm.daily_loss_limit_pct == 0.15
+
+
+class TestPositionManagerCanOpen:
+    """Testes para PositionManager.can_open."""
+
+    def test_can_open_initial(self, pm: PositionManager) -> None:
+        """Deve permitir abrir posição inicialmente."""
+        ok, reason = pm.can_open()
+        assert ok is True
+        assert reason == "ok"
+
+    def test_max_open_trades(self, pm: PositionManager) -> None:
+        """Deve bloquear quando atingir max_open_trades."""
+        for i in range(pm.max_open_trades):
+            pm.add(Position(
+                symbol=f"ASSET{i}/USDC",
+                side="buy",
+                entry_price=100.0,
+                qty=1.0,
+            ))
+        ok, reason = pm.can_open()
+        assert ok is False
+        assert "max_open_trades" in reason
+
+    def test_drawdown_limit(self, pm: PositionManager) -> None:
+        """Deve bloquear quando drawdown excede limite."""
+        pm.current_balance = 5000  # 50% drawdown
+        pm.peak_balance = 10000
+        ok, reason = pm.can_open()
+        assert ok is False
+        assert "drawdown" in reason
+
+    def test_daily_loss_limit(self, pm: PositionManager) -> None:
+        """Deve bloquear quando perda diária excede limite."""
+        pm.pnl_today = -2000  # 20% de perda (limite=10%)
+        pm.peak_balance = 10000
+        ok, reason = pm.can_open()
+        assert ok is False
+        assert "daily_loss" in reason
+
+    def test_consecutive_losses(self, pm: PositionManager) -> None:
+        """Deve bloquear quando perdas consecutivas excedem limite."""
+        pm.consecutive_losses = 5
+        ok, reason = pm.can_open()
+        assert ok is False
+        assert "consecutive_losses" in reason
+
+    def test_cooldown(self, pm: PositionManager) -> None:
+        """Deve bloquear durante cooldown pós-loss."""
+        pm._last_loss_ts = time.monotonic() - 10  # 10s atrás (cooldown=300s)
+        ok, reason = pm.can_open()
+        assert ok is False
+        assert "cooldown" in reason
+
+    def test_cooldown_expired(self, pm: PositionManager) -> None:
+        """Deve permitir após cooldown expirar."""
+        pm._last_loss_ts = time.monotonic() - 600  # 600s atrás (>300s)
+        ok, reason = pm.can_open()
+        assert ok is True
+        assert reason == "ok"
+
+
+class TestPositionManagerAdd:
+    """Testes para PositionManager.add."""
+
+    def test_add_position(self, pm: PositionManager, sample_position: Position) -> None:
+        """Deve adicionar posição à lista."""
+        pm.add(sample_position)
+        assert len(pm.positions) == 1
+        assert pm.positions[0].symbol == "BTC/USDC"
+
+    def test_add_invalid_type(self, pm: PositionManager) -> None:
+        """Deve rejeitar tipo inválido."""
+        pm.add("not_a_position")  # type: ignore
+        assert len(pm.positions) == 0
+
+
+class TestPositionManagerRecordClose:
+    """Testes para PositionManager.record_close."""
+
+    def test_record_close_profit(self, pm: PositionManager, sample_position: Position) -> None:
+        """Deve registrar fechamento com lucro."""
+        pm.add(sample_position)
+        result = pm.record_close(sample_position, exit_price=51000)
+        assert result["net_pnl"] > 0
+        assert pm.consecutive_losses == 0
+        assert len(pm.positions) == 0
+
+    def test_record_close_loss(self, pm: PositionManager, sample_position: Position) -> None:
+        """Deve registrar fechamento com perda."""
+        pm.add(sample_position)
+        result = pm.record_close(sample_position, exit_price=49000)
+        assert result["net_pnl"] < 0
+        assert pm.consecutive_losses == 1
+        assert pm._last_loss_ts > 0
+
+    def test_record_close_not_found(self, pm: PositionManager, sample_position: Position) -> None:
+        """Deve tratar posição não encontrada."""
+        result = pm.record_close(sample_position, exit_price=51000)
+        assert "error" in result
+
+
+class TestPositionManagerCheckExits:
+    """Testes para PositionManager.check_exits."""
+
+    def test_hit_take_profit(self, pm: PositionManager, sample_position: Position) -> None:
+        """Deve identificar TP atingido."""
+        pm.add(sample_position)
+        to_close = pm.check_exits(price=53000)
+        assert len(to_close) == 1
+        assert to_close[0].symbol == "BTC/USDC"
+
+    def test_hit_stop_loss(self, pm: PositionManager, sample_position: Position) -> None:
+        """Deve identificar SL atingido."""
+        pm.add(sample_position)
+        to_close = pm.check_exits(price=48000)
+        assert len(to_close) == 1
+
+    def test_no_exit(self, pm: PositionManager, sample_position: Position) -> None:
+        """Deve retornar lista vazia sem hits."""
+        pm.add(sample_position)
+        to_close = pm.check_exits(price=50500)
+        assert len(to_close) == 0
+
+    def test_hit_trailing(self, pm: PositionManager) -> None:
+        """Deve identificar trailing stop atingido."""
+        pm.trailing_stop = True
+        pos = Position(
+            symbol="BTC/USDC", side="buy",
+            entry_price=50000, qty=0.1,
+            stop_loss=49000, take_profit=52000,
+            trailing_stop_price=49500,
+        )
+        pm.add(pos)
+        to_close = pm.check_exits(price=49400)
+        assert len(to_close) == 1
+
+
+class TestPositionManagerUpdateTrailing:
+    """Testes para PositionManager.update_trailing."""
+
+    def test_trailing_disabled(self, pm: PositionManager, sample_position: Position) -> None:
+        """Não deve atualizar trailing quando desabilitado."""
+        pm.add(sample_position)
+        pm.update_trailing(price=51000)
+        assert sample_position.trailing_stop_price == 0.0
+
+    def test_trailing_long_update(self, pm: PositionManager) -> None:
+        """Deve atualizar trailing stop para LONG."""
+        pm.trailing_stop = True
+        pm.trailing_stop_pct = 0.01
+        pm.trailing_activation_pct = 0.0  # sem ativação mínima
+
+        pos = Position(
+            symbol="BTC/USDC", side="buy",
+            entry_price=50000, qty=0.1,
+            stop_loss=49000, take_profit=52000,
+        )
+        pm.add(pos)
+        pm.update_trailing(price=51000)
+        # nt = 51000 * (1 - 0.01) = 50490
+        assert pos.trailing_stop_price == 50490.0
+
+    def test_trailing_short_update(self, pm: PositionManager) -> None:
+        """Deve atualizar trailing stop para SHORT."""
+        pm.trailing_stop = True
+        pm.trailing_stop_pct = 0.01
+        pm.trailing_activation_pct = 0.0
+
+        pos = Position(
+            symbol="BTC/USDC", side="sell",
+            entry_price=50000, qty=0.1,
+            stop_loss=51000, take_profit=48000,
+            trailing_stop_price=51000,  # inicializado acima do entry
+        )
+        pm.add(pos)
+        pm.update_trailing(price=49000)
+        # nt = 49000 * (1 + 0.01) = 49490
+        # 49490 < 51000 (trailing_stop_price anterior) -> True
+        assert pos.trailing_stop_price == 49490.0
+
+
+class TestPositionManagerToDict:
+    """Testes para PositionManager.to_dict."""
+
+    def test_to_dict_empty(self, pm: PositionManager) -> None:
+        """Deve retornar dict vazio."""
+        d = pm.to_dict()
+        assert d["positions"] == []
+        assert d["pnl_today"] == 0.0
+
+    def test_to_dict_with_position(self, pm: PositionManager, sample_position: Position) -> None:
+        """Deve retornar dict com posição."""
+        pm.add(sample_position)
+        d = pm.to_dict()
+        assert len(d["positions"]) == 1
+        assert d["positions"][0]["symbol"] == "BTC/USDC"

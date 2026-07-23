@@ -1,0 +1,20 @@
+{
+  "capital_usd": 100.0,
+  "max_drawdown_pct": 0.15,
+  "max_daily_loss_pct": 0.10,
+  "max_consecutive_losses": 5,
+  "circuit_breaker_loss_pct": 0.25,
+  "circuit_breaker_cooldown_min": 60,
+  "max_leverage": 3,
+  "taker_fee": 0.0005,
+  "maker_fee": 0.0002,
+  "default_slippage": 0.05,
+  "telegram_enabled": false,
+  "discord_enabled": false,
+  "email_enabled": false,
+  "dashboard_enabled": true,
+  "dashboard_port": 8080,
+  "dashboard_host": "0.0.0.0",
+  "healthcheck_port": 8081,
+  "prometheus_port": 9090
+}

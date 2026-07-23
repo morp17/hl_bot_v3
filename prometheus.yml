@@ -1,0 +1,16 @@
+# ============================================================
+# Hyperliquid Production Bot v3.0 — Prometheus Config
+# ============================================================
+# Uso: montado em /etc/prometheus/prometheus.yml no container
+# ============================================================
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "hl-bot"
+    static_configs:
+      - targets: ["bot:9090"]
+    scrape_interval: 15s
+    metrics_path: /api/metrics
