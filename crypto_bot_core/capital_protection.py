@@ -75,7 +75,7 @@ class CapitalProtection:
         trade_hour_end_utc: int = 0,
         max_spread_pct: float = 0.005,
         max_funding_rate: float = 0.001,
-        btc_crash_filter_pct: float = 0.0,
+        # REMOVIDO: btc_crash_filter_pct (nunca teve verificação implementada)
     ) -> None:
         """
         Inicializa o sistema de proteção.
@@ -94,7 +94,6 @@ class CapitalProtection:
             trade_hour_end_utc: Hora UTC de fim.
             max_spread_pct: Spread máximo permitido.
             max_funding_rate: Funding rate máximo permitido.
-            btc_crash_filter_pct: Filtro de crash BTC (%).
         """
         self.max_daily_loss_pct = max_daily_loss_pct
         self.max_drawdown_pct = max_drawdown_pct
@@ -108,7 +107,7 @@ class CapitalProtection:
         self.trade_hour_end_utc = trade_hour_end_utc
         self.max_spread_pct = max_spread_pct
         self.max_funding_rate = max_funding_rate
-        self.btc_crash_filter_pct = btc_crash_filter_pct
+        # REMOVIDO: self.btc_crash_filter_pct = btc_crash_filter_pct
 
         self.state = ProtectionState(
             peak_balance=initial_balance,
@@ -437,9 +436,20 @@ class CapitalProtection:
         except Exception as e:
             log.error(f"[PROT] Erro ao registrar trade: {e}")
 
-    def check_all(self) -> Tuple[bool, List[str]]:
+    def check_all(
+        self,
+        spread_pct: Optional[float] = None,
+        funding_rate: Optional[float] = None,
+    ) -> Tuple[bool, List[str]]:
         """
         Executa todas as verificações de proteção.
+
+        Args:
+            spread_pct: Spread atual (%). Se None, o check é pulado
+                (fail-open) — quem chama sem esse dado não bloqueia
+                por spread, mas também não está protegido por ele.
+            funding_rate: Funding rate atual. Mesma lógica de fail-open
+                se None.
 
         Returns:
             Tuple[bool, List[str]]: (pode_operar, lista_de_motivos).
@@ -453,6 +463,12 @@ class CapitalProtection:
             ("consecutive_losses", self.check_consecutive_losses()),
             ("cooldown", self.check_cooldown()),
         ]
+
+        # NOVO: spread e funding só entram se o valor foi fornecido
+        if spread_pct is not None:
+            checks.append(("spread", self.check_spread(spread_pct)))
+        if funding_rate is not None:
+            checks.append(("funding_rate", self.check_funding_rate(funding_rate)))
 
         all_ok = True
         for name, (ok, reason) in checks:

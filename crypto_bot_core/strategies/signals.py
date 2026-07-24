@@ -624,6 +624,12 @@ def get_signal(df: pd.DataFrame, cfg: BotConfig) -> SignalWithParams:
     """
     Obtém sinal da estratégia configurada.
 
+    Antes de executar, verifica se a estratégia está em
+    cfg.enabled_strategies. Estratégias fora dessa lista (ex:
+    mean_reversion, orderflow_delta, funding_arbitrage — sem
+    validação walk-forward suficiente, ver auditoria item 9)
+    retornam hold sem executar a lógica de sinal.
+
     Args:
         df: DataFrame com indicadores.
         cfg: Configuração do bot.
@@ -633,6 +639,17 @@ def get_signal(df: pd.DataFrame, cfg: BotConfig) -> SignalWithParams:
     """
     try:
         strategy_name = cfg.strategy.value
+
+        # NOVO: bloqueio por enabled_strategies
+        if not cfg.is_strategy_enabled():
+            log.warning(
+                f"[SIGNAL] Estratégia '{strategy_name}' não está em "
+                f"enabled_strategies ('{cfg.enabled_strategies}') — "
+                f"retornando hold. Habilite explicitamente no .env "
+                f"apenas após validação walk-forward."
+            )
+            return "hold", {"reason": f"estrategia_desabilitada: {strategy_name}"}
+
         strategy_func = STRATEGY_MAP.get(strategy_name)
 
         if strategy_func is None:

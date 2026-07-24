@@ -13,12 +13,31 @@ Uso:
     print(result.summary())
     result.export_csv("backtest_result.csv")
 
+    # Walk-forward (validação de robustez temporal, sem reotimização
+    # de parâmetros entre janelas):
+    results = engine.run_walk_forward(df)
+
 Requisitos:
 - Type hints
 - Tratamento de exceções com try/except
 - Validação de inputs
 - Logs estruturados
 - Testes unitários em tests/test_backtest.py
+
+NOTA METODOLÓGICA (ver auditoria — itens 6 e 7):
+- Slippage é aplicado tanto na entrada quanto na saída (config
+  backtest.slippage_pct), o que antes era lido do BotConfig mas
+  nunca usado no loop de simulação.
+- TP/SL são checados contra high/low da barra (não apenas close).
+  Quando ambos SL e TP estão dentro do range da mesma barra, o SL é
+  assumido como tocado primeiro — premissa CONSERVADORA arbitrária,
+  não um fato: sem dados intrabar (tick/M1) não há como saber a
+  ordem real dos toques. Resultados devem ser lidos com essa
+  ressalva.
+- run_walk_forward() particiona os dados em janelas sequenciais e
+  roda cada uma isoladamente, SEM reotimizar STRATEGY_DEFAULTS por
+  janela — é uma checagem de robustez/consistência temporal, não uma
+  walk-forward optimization completa.
 """
 
 from __future__ import annotations
@@ -48,8 +67,8 @@ class BacktestTrade:
         entry_time: Timestamp de entrada.
         exit_time: Timestamp de saída.
         side: "buy" ou "sell".
-        entry_price: Preço de entrada.
-        exit_price: Preço de saída.
+        entry_price: Preço de entrada (já com slippage aplicado).
+        exit_price: Preço de saída (já com slippage aplicado).
         qty: Quantidade do ativo.
         stop_loss: Preço do stop loss.
         take_profit: Preço do take profit.
@@ -171,6 +190,11 @@ class BacktestResult:
                 f"  Max Drawdown: ${self.max_drawdown:.2f} ({self.max_drawdown_pct:.2%})",
                 f"  Sharpe Ratio: {self.sharpe_ratio:.3f}",
                 f"  Total Fees:   ${self.total_fees:.4f}",
+                "=" * 55,
+                "  NOTA: SL/TP checados via high/low intrabar; quando ambos",
+                "  são tocados na mesma barra, SL é assumido primeiro (premissa",
+                "  conservadora, não garantida). Slippage aplicado conforme",
+                "  backtest.slippage_pct. Ver documentação do módulo.",
                 "=" * 55,
             ]
             return "\n".join(lines)
@@ -385,6 +409,9 @@ class BacktestEngine:
             stop_loss_pct = self.cfg.risk.stop_loss_pct / 100.0
             take_profit_pct = self.cfg.risk.take_profit_pct / 100.0
             taker_fee = self.cfg.risk.taker_fee
+            # FIX (item 7 auditoria): slippage_pct existia na config mas nunca
+            # era lido/aplicado no loop de simulação — agora é.
+            slippage_pct = self.cfg.backtest.slippage_pct / 100.0
             trailing_stop_enabled = self.cfg.risk.trailing_stop
             trailing_activation_pct = self.cfg.risk.trailing_stop_activation_pct / 100.0
             trailing_stop_pct = self.cfg.risk.trailing_stop_distance_pct / 100.0
@@ -398,6 +425,8 @@ class BacktestEngine:
                     bar = df.iloc[:i + 1]
                     current = df.iloc[i]
                     price = float(current["close"])
+                    high = float(current["high"])
+                    low = float(current["low"])
                     atr = float(current["atr"]) if pd.notna(current.get("atr", np.nan)) else 0.0
 
                     if price <= 0 or atr <= 0:
@@ -408,27 +437,44 @@ class BacktestEngine:
                     for pos in list(positions):
                         try:
                             exit_reason: Optional[str] = None
+                            # Preço de execução do fechamento antes do slippage.
+                            # Default = close da barra; sobrescrito abaixo se
+                            # o fechamento ocorreu por TP/SL/trailing tocado
+                            # via high/low (mais realista que usar sempre close).
+                            exit_price_raw: float = price
 
-                            # Take Profit
-                            if pos["side"] == "buy" and price >= pos["take_profit"]:
-                                exit_reason = "take_profit"
-                            elif pos["side"] == "sell" and price <= pos["take_profit"]:
-                                exit_reason = "take_profit"
+                            # FIX (item 6 auditoria): checagem via high/low
+                            # intrabar em vez de apenas close. Quando SL e TP
+                            # estão ambos dentro do range [low, high] da mesma
+                            # barra, SL é assumido tocado primeiro — premissa
+                            # CONSERVADORA arbitrária (não factual sem dados
+                            # tick/M1), adotada para não superestimar performance.
+                            if pos["side"] == "buy":
+                                if low <= pos["stop_loss"]:
+                                    exit_reason = "stop_loss"
+                                    exit_price_raw = pos["stop_loss"]
+                                elif high >= pos["take_profit"]:
+                                    exit_reason = "take_profit"
+                                    exit_price_raw = pos["take_profit"]
+                            else:  # sell
+                                if high >= pos["stop_loss"]:
+                                    exit_reason = "stop_loss"
+                                    exit_price_raw = pos["stop_loss"]
+                                elif low <= pos["take_profit"]:
+                                    exit_reason = "take_profit"
+                                    exit_price_raw = pos["take_profit"]
 
-                            # Stop Loss
-                            if pos["side"] == "buy" and price <= pos["stop_loss"]:
-                                exit_reason = "stop_loss"
-                            elif pos["side"] == "sell" and price >= pos["stop_loss"]:
-                                exit_reason = "stop_loss"
-
-                            # Trailing Stop
-                            if trailing_stop_enabled:
-                                if pos["side"] == "buy" and price <= pos["trailing_stop"]:
+                            # Trailing Stop — também checado via high/low
+                            if trailing_stop_enabled and exit_reason is None:
+                                if pos["side"] == "buy" and low <= pos["trailing_stop"]:
                                     exit_reason = "trailing_stop"
-                                elif pos["side"] == "sell" and price >= pos["trailing_stop"]:
+                                    exit_price_raw = pos["trailing_stop"]
+                                elif pos["side"] == "sell" and high >= pos["trailing_stop"]:
                                     exit_reason = "trailing_stop"
+                                    exit_price_raw = pos["trailing_stop"]
 
-                                # Atualizar trailing stop
+                                # Atualizar trailing stop (baseado em close,
+                                # comportamento original preservado)
                                 if pos["side"] == "buy" and price > pos["entry_price"]:
                                     activation_price = pos["entry_price"] * (1 + trailing_activation_pct)
                                     if price >= activation_price:
@@ -443,10 +489,17 @@ class BacktestEngine:
                                             pos["trailing_stop"] = new_trail
 
                             if exit_reason:
-                                # Fechar posição
+                                # FIX (item 7 auditoria): aplicar slippage no
+                                # preço de saída. Fechamento sempre é contra o
+                                # trader (pior preço na direção do fechamento).
+                                if pos["side"] == "buy":
+                                    fill_exit_price = exit_price_raw * (1 - slippage_pct)
+                                else:
+                                    fill_exit_price = exit_price_raw * (1 + slippage_pct)
+
                                 mult = 1 if pos["side"] == "buy" else -1
-                                gross = (price - pos["entry_price"]) * pos["qty"] * mult
-                                fees = (pos["entry_price"] + price) * pos["qty"] * taker_fee
+                                gross = (fill_exit_price - pos["entry_price"]) * pos["qty"] * mult
+                                fees = (pos["entry_price"] + fill_exit_price) * pos["qty"] * taker_fee
                                 net = gross - fees
                                 cost_basis = pos["entry_price"] * pos["qty"]
                                 pnl_pct = (net / cost_basis * 100) if cost_basis > 0 else 0.0
@@ -456,7 +509,7 @@ class BacktestEngine:
                                     exit_time=str(df.index[i]),
                                     side=pos["side"],
                                     entry_price=pos["entry_price"],
-                                    exit_price=price,
+                                    exit_price=fill_exit_price,
                                     qty=pos["qty"],
                                     stop_loss=pos["stop_loss"],
                                     take_profit=pos["take_profit"],
@@ -496,21 +549,35 @@ class BacktestEngine:
                                     df=bar,
                                 )
 
+                                # FIX (item 1+2 auditoria): stop_loss_pct
+                                # agora é passado explicitamente, pois
+                                # calc_position_size deixou de usar uma
+                                # estimativa de distância de stop desacoplada
+                                # de calc_stops() — ver crypto_bot_core/risk.py
                                 qty = calc_position_size(
                                     balance=balance,
                                     price=price,
                                     atr=atr,
                                     risk_per_trade=risk_per_trade,
                                     max_capital_pct=max_capital_pct,
+                                    stop_loss_pct=stop_loss_pct,
                                 )
 
                                 if qty > 0 and sl > 0 and tp > 0:
+                                    # FIX (item 7 auditoria): aplicar slippage
+                                    # na entrada. Entrada sempre é contra o
+                                    # trader (pior preço na direção da entrada).
+                                    if signal == "buy":
+                                        fill_entry_price = price * (1 + slippage_pct)
+                                    else:
+                                        fill_entry_price = price * (1 - slippage_pct)
+
                                     # Trailing stop inicial = stop loss
                                     trail_initial = sl
 
                                     positions.append({
                                         "side": signal,
-                                        "entry_price": price,
+                                        "entry_price": fill_entry_price,
                                         "qty": qty,
                                         "stop_loss": sl,
                                         "take_profit": tp,
@@ -519,8 +586,8 @@ class BacktestEngine:
                                     })
 
                                     log.debug(
-                                        f"[BACKTEST] Entrada {signal.upper()} @ {price:.2f} "
-                                        f"qty={qty:.6f} SL={sl:.2f} TP={tp:.2f}"
+                                        f"[BACKTEST] Entrada {signal.upper()} @ {fill_entry_price:.2f} "
+                                        f"(raw={price:.2f}) qty={qty:.6f} SL={sl:.2f} TP={tp:.2f}"
                                     )
                     except Exception as e:
                         log.error(
@@ -539,9 +606,18 @@ class BacktestEngine:
             # ── Fechar posições remanescentes no final ─────
             try:
                 for pos in list(positions):
+                    # Fechamento forçado por fim de dados — sem checagem de
+                    # high/low (não há "toque" de nível, é fechamento a
+                    # mercado no close da última barra), mas slippage ainda
+                    # se aplica pois é uma execução real.
+                    if pos["side"] == "buy":
+                        fill_exit_price = price * (1 - slippage_pct)
+                    else:
+                        fill_exit_price = price * (1 + slippage_pct)
+
                     mult = 1 if pos["side"] == "buy" else -1
-                    gross = (price - pos["entry_price"]) * pos["qty"] * mult
-                    fees = (pos["entry_price"] + price) * pos["qty"] * taker_fee
+                    gross = (fill_exit_price - pos["entry_price"]) * pos["qty"] * mult
+                    fees = (pos["entry_price"] + fill_exit_price) * pos["qty"] * taker_fee
                     net = gross - fees
                     cost_basis = pos["entry_price"] * pos["qty"]
                     pnl_pct = (net / cost_basis * 100) if cost_basis > 0 else 0.0
@@ -551,7 +627,7 @@ class BacktestEngine:
                         exit_time=str(df.index[len(df) - 1]),
                         side=pos["side"],
                         entry_price=pos["entry_price"],
-                        exit_price=price,
+                        exit_price=fill_exit_price,
                         qty=pos["qty"],
                         stop_loss=pos["stop_loss"],
                         take_profit=pos["take_profit"],
@@ -656,4 +732,132 @@ class BacktestEngine:
             raise
         except Exception as e:
             log.error(f"[BACKTEST] Erro fatal na execução: {e}")
+            raise
+
+    def run_walk_forward(
+        self, df: pd.DataFrame, windows: Optional[int] = None
+    ) -> List[BacktestResult]:
+        """
+        Executa walk-forward validation: particiona df em N janelas
+        sequenciais e roda o backtest em cada uma isoladamente.
+
+        Diferente de simplesmente rodar em todo o período de uma vez,
+        isso permite observar a consistência (ou instabilidade) do
+        resultado ao longo de sub-períodos distintos — um resultado
+        agregado positivo pode mascarar 1 janela excelente e 3 ruins,
+        o que indicaria dependência forte de regime de mercado
+        específico em vez de edge estrutural da estratégia.
+
+        NOTA: esta é uma walk-forward SEM reotimização de parâmetros
+        entre janelas (os STRATEGY_DEFAULTS de config.py permanecem
+        fixos em todas as janelas). É uma validação de ROBUSTEZ
+        temporal/consistência, não uma walk-forward optimization
+        completa (que reajustaria hiperparâmetros por janela com
+        dados in-sample e testaria out-of-sample). Não apresentar
+        o resultado como algo mais rigoroso do que isso.
+
+        Args:
+            df: DataFrame completo com indicadores já calculados.
+            windows: Número de janelas (default:
+                cfg.backtest.walk_forward_windows).
+
+        Returns:
+            List[BacktestResult]: um resultado por janela processada
+            (janelas menores que 50 velas são puladas e logadas).
+
+        Raises:
+            ValueError: se windows < 1 ou dados insuficientes para
+                o número de janelas solicitado.
+        """
+        try:
+            n_windows = windows or self.cfg.backtest.walk_forward_windows
+            if n_windows < 1:
+                raise ValueError(f"windows deve ser >= 1: {n_windows}")
+
+            if df is None:
+                raise ValueError("df não pode ser None")
+
+            total_len = len(df)
+            if total_len < 50 * n_windows:
+                raise ValueError(
+                    f"Dados insuficientes para {n_windows} janelas: "
+                    f"{total_len} velas (mínimo {50 * n_windows})"
+                )
+
+            window_size = total_len // n_windows
+            results: List[BacktestResult] = []
+
+            log.info(
+                f"[WALK-FORWARD] Iniciando {n_windows} janelas de "
+                f"~{window_size} velas cada (total {total_len} velas)"
+            )
+
+            for w in range(n_windows):
+                start = w * window_size
+                end = total_len if w == n_windows - 1 else (w + 1) * window_size
+                window_df = df.iloc[start:end]
+
+                if len(window_df) < 50:
+                    log.warning(
+                        f"[WALK-FORWARD] Janela {w + 1}/{n_windows} pequena "
+                        f"demais ({len(window_df)} velas), pulando"
+                    )
+                    continue
+
+                log.info(
+                    f"[WALK-FORWARD] Janela {w + 1}/{n_windows}: "
+                    f"{window_df.index[0]} → {window_df.index[-1]} "
+                    f"({len(window_df)} velas)"
+                )
+
+                try:
+                    result = self.run(window_df)
+                    results.append(result)
+                    log.info(
+                        f"[WALK-FORWARD] Janela {w + 1}/{n_windows} concluída: "
+                        f"{result.total_trades} trades, "
+                        f"win_rate={result.win_rate:.1f}%, "
+                        f"retorno={((result.final_capital / result.initial_capital) - 1) * 100:+.2f}%"
+                    )
+                except ValueError as e:
+                    log.warning(
+                        f"[WALK-FORWARD] Janela {w + 1}/{n_windows} falhou "
+                        f"na validação, pulando: {e}"
+                    )
+                    continue
+
+            if not results:
+                log.warning(
+                    "[WALK-FORWARD] Nenhuma janela produziu resultado válido"
+                )
+
+            # Resumo de consistência entre janelas (log apenas — não altera
+            # o retorno, mas ajuda a leitura rápida sem reprocessar tudo)
+            if len(results) > 1:
+                win_rates = [r.win_rate for r in results]
+                returns_pct = [
+                    ((r.final_capital / r.initial_capital) - 1) * 100
+                    for r in results
+                ]
+                positive_windows = sum(1 for r in returns_pct if r > 0)
+                log.info(
+                    f"[WALK-FORWARD] Resumo: {positive_windows}/{len(results)} "
+                    f"janelas positivas | win_rate min={min(win_rates):.1f}% "
+                    f"max={max(win_rates):.1f}% | retorno min={min(returns_pct):+.2f}% "
+                    f"max={max(returns_pct):+.2f}%"
+                )
+                if positive_windows < len(results):
+                    log.warning(
+                        f"[WALK-FORWARD] {len(results) - positive_windows} "
+                        f"janela(s) negativa(s) — resultado agregado pode "
+                        f"mascarar inconsistência temporal. Revisar antes de "
+                        f"usar em produção."
+                    )
+
+            return results
+
+        except ValueError:
+            raise
+        except Exception as e:
+            log.error(f"[WALK-FORWARD] Erro fatal: {e}")
             raise

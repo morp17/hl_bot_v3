@@ -1,20 +1,32 @@
 {
   "capital_usd": 100.0,
-  "max_drawdown_pct": 0.15,
-  "max_daily_loss_pct": 0.10,
-  "max_consecutive_losses": 5,
-  "circuit_breaker_loss_pct": 0.25,
-  "circuit_breaker_cooldown_min": 60,
-  "max_leverage": 3,
-  "taker_fee": 0.0005,
-  "maker_fee": 0.0002,
-  "default_slippage": 0.05,
-  "telegram_enabled": false,
-  "discord_enabled": false,
-  "email_enabled": false,
-  "dashboard_enabled": true,
-  "dashboard_port": 8080,
-  "dashboard_host": "0.0.0.0",
-  "healthcheck_port": 8081,
-  "prometheus_port": 9090
+  "leverage": 3,
+  "isolated_margin": true,
+  "max_position_pct": 20.0,
+  "risk_per_trade_pct": 1.0,
+  "enabled_strategies": "trend_follow,adaptive_trend,hybrid_regime",
+
+  "risk": {
+    "max_drawdown_pct": 15.0,
+    "daily_loss_limit_pct": 10.0,
+    "max_consecutive_losses": 5,
+    "circuit_breaker_loss_pct": 25.0,
+    "circuit_breaker_cooldown_sec": 3600,
+    "taker_fee": 0.0005
+  },
+
+  "dashboard": {
+    "enabled": true,
+    "port": 8080,
+    "host": "0.0.0.0"
+  },
+
+  "monitoring": {
+    "prometheus_port": 9090,
+    "health_check_port": 8081
+  },
+
+  "backtest": {
+    "slippage_pct": 0.05
+  }
 }

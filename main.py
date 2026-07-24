@@ -27,7 +27,7 @@ import pandas as pd
 from loguru import logger as log
 
 from crypto_bot_core.capital_protection import CapitalProtection
-from crypto_bot_core.config import BotConfig, StrategyType, get_config
+from crypto_bot_core.config import BotConfig, StrategyType, SymbolConfig, get_config
 from crypto_bot_core.execution import OrderExecutor
 from crypto_bot_core.indicators import add_all_indicators, get_latest_values
 from crypto_bot_core.monitoring import Monitor
@@ -101,6 +101,7 @@ class HyperliquidBot:
             trailing_activation_pct=r.trailing_stop_activation_pct / 100.0,
             trailing_stop_pct=r.trailing_stop_distance_pct / 100.0,
             taker_fee=r.taker_fee,
+            max_position_pct=cfg.max_position_pct / 100.0,   # NOVO
         )
         self.capital_protection = CapitalProtection(
             initial_balance=cfg.capital_usd,
@@ -119,10 +120,9 @@ class HyperliquidBot:
             btc_crash_filter_pct=r.btc_crash_filter_pct / 100.0,
         )
         self.notificator = Notificator(
-            telegram_token=n.telegram_bot_token or None,
-            telegram_chat_id=n.telegram_chat_id or None,
-            discord_webhook=n.discord_webhook_url or None,
-        )
+    telegram_token=n.telegram_bot_token or None,   # sempre None se o bug ocorrer
+    telegram_chat_id=n.telegram_chat_id or None,
+)
         self.staking = StakingManager(cfg)
         self.monitor = Monitor()
 
@@ -133,10 +133,35 @@ class HyperliquidBot:
         )
         self._health_server.start()
 
-        # Estado
-        self._symbols: List[str] = []
+        # Dashboard server (FIX arquitetural: agora roda como thread
+        # DENTRO deste processo, não mais como --mode dashboard separado
+        # — ver crypto_bot_core/dashboard/main.py::start_dashboard_thread)
+        from crypto_bot_core.dashboard.main import start_dashboard_thread
+        self._dashboard_thread = start_dashboard_thread(cfg)
+
+       # Estado
+        self._symbols: List[SymbolConfig] = []   # ALTERADO: era List[str]
         self._last_signals: Dict[str, str] = {}
         self._synced_from_exchange: bool = False
+
+        # ── Aplicar leverage/margem por símbolo (FIX item 3: antes nunca era chamado) ──
+        try:
+            symbol_configs = self.cfg.parse_symbols()
+            for sc in symbol_configs:
+                if not sc.enabled:
+                    continue
+                ok = self.executor.update_leverage(
+                    symbol=sc.symbol,
+                    leverage=sc.leverage,
+                    is_cross=not sc.isolated_margin,
+                )
+                if not ok:
+                    log.warning(
+                        f"[INIT] Falha ao aplicar leverage {sc.leverage}x "
+                        f"em {sc.symbol} — verifique conexão/credenciais"
+                    )
+        except Exception as e:
+            log.error(f"[INIT] Erro ao aplicar leverage por símbolo: {e}")
 
         log.info("=" * 50)
         log.info("Hyperliquid Production Bot v3.0")
@@ -145,14 +170,18 @@ class HyperliquidBot:
         log.info(f"Capital: ${cfg.capital_usd:,.2f}")
         log.info("=" * 50)
 
-    def _load_symbols(self) -> List[str]:
-        """Carrega lista de símbolos para operar."""
+    def _load_symbols(self) -> List[SymbolConfig]:
+        """Carrega configurações completas por símbolo (não só o nome)."""
         try:
-            symbols = self.cfg.parse_symbols()
-            return [s.symbol for s in symbols]
+            return self.cfg.parse_symbols()
         except Exception as e:
             log.error(f"Erro ao carregar símbolos: {e}")
-            return ["BTC/USDC", "ETH/USDC", "SOL/USDC"]
+            # fallback mínimo
+            from crypto_bot_core.config import SymbolConfig as _SC
+            return [
+                _SC(symbol=s, coin=s.split("/")[0])
+                for s in ["BTC/USDC", "ETH/USDC", "SOL/USDC"]
+            ]
 
     def _normalize_symbol(self, raw_symbol: str) -> str:
         """
@@ -408,111 +437,150 @@ class HyperliquidBot:
         except Exception as e:
             log.debug(f"[VERIFY] Erro ao verificar posições na DEX: {e}")
 
-    async def _process_symbol(self, symbol: str) -> None:
+    async def _process_symbol(self, sym_cfg: SymbolConfig) -> None:
         """
         Processa um símbolo: busca dados, gera sinal, executa.
 
         Args:
-            symbol: Símbolo a processar.
+            sym_cfg: Configuração específica do símbolo (estratégia,
+                timeframe, risco e leverage podem sobrescrever os
+                globais — ver SymbolConfig).
         """
+        symbol = sym_cfg.symbol
         try:
             log.debug(f"Processando {symbol}...")
 
-            # 1. Buscar dados OHLCV (retorna List[List[float]] do ccxt)
             connector = self.executor.connector
-            ohlcv_data = connector.fetch_ohlcv(symbol, self.cfg.timeframe.value, limit=350)
+
+            # Estratégia/timeframe efetivos: override do símbolo > global (FIX item 4)
+            effective_strategy = sym_cfg.strategy or self.cfg.strategy
+            effective_timeframe = sym_cfg.timeframe or self.cfg.timeframe
+
+            # 1. Buscar dados OHLCV
+            ohlcv_data = connector.fetch_ohlcv(symbol, effective_timeframe.value, limit=350)
 
             if ohlcv_data is None or len(ohlcv_data) == 0:
                 log.warning(f"[{symbol}] Dados OHLCV indisponíveis")
                 return
 
-            # Converter para DataFrame
             df = pd.DataFrame(
                 ohlcv_data,
                 columns=["timestamp", "open", "high", "low", "close", "volume"],
             )
 
-            # 2. Adicionar indicadores
-            df = add_all_indicators(df, self.cfg)
+            # 1b. Buscar funding rate atual (FIX item 5 — antes nunca era buscado)
+            coin = symbol.replace("/USDC", "").replace("/USD", "")
+            funding_rate = connector.get_current_funding_rate(coin)
 
-            # 3. Gerar sinal
-            signal, params = get_signal(df, self.cfg)
+            # 2. Adicionar indicadores (com strategy/timeframe efetivos e funding)
+            #    NOTA: get_strategy_params dentro das estratégias ainda lê
+            #    cfg.strategy/cfg.timeframe globais (ver strategies/signals.py) —
+            #    para overrides por símbolo afetarem os PARÂMETROS internos da
+            #    estratégia (não só qual estratégia roda), seria necessário
+            #    também parametrizar get_signal() por símbolo. Fora do escopo
+            #    desta correção mínima; documentar como limitação conhecida.
+            df = add_all_indicators(df, self.cfg, funding_rate=funding_rate)
+
+            # 3. Gerar sinal — usa cfg global (limitação acima); troca temporária
+            #    de cfg.strategy/timeframe se houver override no símbolo:
+            original_strategy, original_timeframe = self.cfg.strategy, self.cfg.timeframe
+            if sym_cfg.strategy or sym_cfg.timeframe:
+                self.cfg.strategy = effective_strategy
+                self.cfg.timeframe = effective_timeframe
+            try:
+                signal, params = get_signal(df, self.cfg)
+            finally:
+                self.cfg.strategy, self.cfg.timeframe = original_strategy, original_timeframe
+
             self._last_signals[symbol] = signal
             self.monitor.update_signal(signal)
 
-            # 4. Verificar proteções
-            protection_ok, reasons = self.capital_protection.check_all()
+            # 4. Buscar spread para checagem de proteção (FIX item 2 capital_protection)
+            spread_pct = None
+            try:
+                ticker = connector.fetch_ticker(symbol)
+                if ticker and ticker.get("bid") and ticker.get("ask"):
+                    bid, ask = float(ticker["bid"]), float(ticker["ask"])
+                    mid = (bid + ask) / 2
+                    if mid > 0:
+                        spread_pct = (ask - bid) / mid
+            except Exception as e:
+                log.debug(f"[{symbol}] Erro ao buscar spread: {e}")
+
+            # 5. Verificar proteções (agora com spread e funding)
+            protection_ok, reasons = self.capital_protection.check_all(
+                spread_pct=spread_pct,
+                funding_rate=funding_rate,
+            )
             if not protection_ok:
                 log.info(f"[{symbol}] Proteção bloqueou: {reasons}")
                 return
 
-            # 5. Extrair valores mais recentes do DataFrame
+            # 6. Extrair valores mais recentes
             latest = get_latest_values(df)
             close_price = latest.get("close", 0)
 
-            # Validar preço contra mark price da Hyperliquid
-            coin = symbol.replace("/USDC", "").replace("/USD", "")
             mark_px = connector.get_mark_price(coin)
             if mark_px and close_price > 0:
                 distance_pct = abs(close_price - mark_px) / mark_px * 100
-                if distance_pct > 50:  # Mais de 50% de diferença = algo errado
+                if distance_pct > 50:
                     log.warning(
                         f"[{symbol}] PREÇO SUSPEITO: close={close_price:.2f} "
                         f"vs mark={mark_px:.2f} (dif={distance_pct:.1f}%) - "
                         f"USANDO MARK PRICE"
                     )
                     close_price = mark_px
-                else:
-                    log.debug(
-                        f"[{symbol}] Preço OK: close={close_price:.2f} "
-                        f"mark={mark_px:.2f} (dif={distance_pct:.1f}%)"
-                    )
 
-            # 6. Verificar se já existe posição para este símbolo na DEX
-            #    (prevenir abertura duplicada)
+            # 7. Verificar posição existente
             existing_positions = [
                 p for p in self.position_manager.positions
                 if p.symbol == symbol
             ]
             if existing_positions:
                 log.debug(f"[{symbol}] Posição já existe ({len(existing_positions)}), pulando abertura")
-                # Mesmo com posição existente, verificar exits
                 await self._check_exits_for_symbol(symbol, close_price, mark_px)
                 return
 
-            # 7. Verificar posições existentes (limite de trades)
+            # 8. Verificar limite de trades
             if signal in ("buy", "sell"):
                 can_open, reason = self.position_manager.can_open()
                 if not can_open:
                     log.info(f"[{symbol}] PositionManager bloqueou: {reason}")
                     return
 
-                # 8. Calcular tamanho da posição
+                # 9. Sizing — usa risco/max_position por símbolo (FIX item 1+4)
+                #    e stop_loss_pct compartilhado com calc_stops (FIX item 2)
                 atr = latest.get("atr", 0)
                 balance = self.position_manager.current_balance
+
+                effective_risk_pct = sym_cfg.risk_per_trade_pct / 100.0
+                effective_max_pos_pct = sym_cfg.max_position_pct / 100.0
+                effective_sl_pct = self.cfg.risk.stop_loss_pct / 100.0
 
                 qty = calc_position_size(
                     balance=balance,
                     price=close_price,
                     atr=atr,
-                    risk_per_trade=self.cfg.risk_per_trade_pct / 100.0,
+                    risk_per_trade=effective_risk_pct,
+                    max_capital_pct=effective_max_pos_pct,   # FIX item 1
+                    stop_loss_pct=effective_sl_pct,          # FIX item 2
                 )
 
                 if qty <= 0:
                     log.warning(f"[{symbol}] Quantidade calculada = 0")
                     return
 
-                # 9. Calcular stops
+                # 10. Stops — mesma stop_loss_pct usada no sizing acima
                 sl, tp = calc_stops(
                     price=close_price,
                     side=signal,
                     atr=atr,
-                    stop_loss_pct=self.cfg.risk.stop_loss_pct / 100.0,
+                    stop_loss_pct=effective_sl_pct,
                     take_profit_pct=self.cfg.risk.take_profit_pct / 100.0,
                     df=df,
                 )
 
-                # 10. Executar ordem com TP/SL nativos
+                # 11. Executar ordem (inalterado)
                 result = self.executor.place_bulk_tpsl(
                     symbol=symbol,
                     side=signal,
@@ -522,9 +590,8 @@ class HyperliquidBot:
                     sl_price=sl,
                 )
 
-                # Verificar resposta da API
                 order_accepted = False
-                order_filled = False  # FIX bugC8: filled = posição real, resting = ordem pendente
+                order_filled = False
                 if result is not None:
                     if isinstance(result, dict):
                         api_status = result.get("status", "")
@@ -558,10 +625,6 @@ class HyperliquidBot:
                     log.error(f"[{symbol}] place_bulk_tpsl retornou None")
 
                 if order_accepted:
-                    # FIX bugC8: SÓ adicionar posição local se a ordem foi PREENCHIDA (filled).
-                    # Se está resting (limit não executada), NÃO adicionar posição ainda.
-                    # O bot vai detectar o fill no próximo ciclo via _sync_from_exchange
-                    # ou via _verify_positions_on_exchange.
                     if order_filled:
                         pos = Position(
                             symbol=symbol,
@@ -573,12 +636,11 @@ class HyperliquidBot:
                             open_time=time.time(),
                         )
                         self.position_manager.add(pos)
-                        # Heartbeat do lock file
                         try:
                             self._lock.heartbeat()
                         except Exception:
                             pass
-            
+
                         self.monitor.record_step(success=True)
 
                         self.notificator.send_trade_alert(
@@ -602,8 +664,6 @@ class HyperliquidBot:
                     log.error(f"[{symbol}] Falha ao executar ordem")
                     self.monitor.record_step(success=False)
 
-            # 11. Verificar exits para posições existentes do símbolo atual
-            # (só se tem posição ou se houve sinal de entrada)
             if existing_positions or signal in ("buy", "sell"):
                 await self._check_exits_for_symbol(symbol, close_price, mark_px)
 
@@ -696,8 +756,10 @@ class HyperliquidBot:
                 self._sync_from_exchange()
 
             # Processar cada símbolo (pode abrir novas posições)
-            for symbol in self._symbols:
-                await self._process_symbol(symbol)
+            for sym_cfg in self._symbols:
+                if not sym_cfg.enabled:
+                    continue
+                await self._process_symbol(sym_cfg)   # ALTERADO: passa SymbolConfig, não string
 
             # FIX bugC8: Verificar posições na DEX DEPOIS de processar símbolos.
             # Antes estava ANTES, o que matava posições recém-abertas no mesmo ciclo
@@ -866,31 +928,18 @@ class HyperliquidBot:
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse argumentos da linha de comando."""
-    parser = argparse.ArgumentParser(
-        description="Hyperliquid Production Bot v3.0"
-    )
+    parser = argparse.ArgumentParser(description="Hyperliquid Production Bot v3.0")
+    parser.add_argument("--mode", choices=["live", "backtest", "dashboard"], default="live")
+    parser.add_argument("--symbol", default="")
+    parser.add_argument("--interval", type=int, default=60)
+    parser.add_argument("--config", default=".env")
     parser.add_argument(
-        "--mode",
-        choices=["live", "backtest", "dashboard"],
-        default="live",
-        help="Modo de operação",
-    )
-    parser.add_argument(
-        "--symbol",
-        default="",
-        help="Símbolo para backtest (ex: BTC/USDC)",
-    )
-    parser.add_argument(
-        "--interval",
-        type=int,
-        default=60,
-        help="Intervalo entre ciclos em segundos",
-    )
-    parser.add_argument(
-        "--config",
-        default=".env",
-        help="Caminho do arquivo de configuração",
+        "--load-json-overrides",
+        action="store_true",
+        help="Carrega bot_config.json por cima do .env no startup "
+             "(útil para retomar ajustes feitos via dashboard em uma "
+             "sessão anterior). Sem esta flag, apenas .env é usado, e "
+             "o dashboard começa com os defaults do .env.",
     )
     return parser.parse_args()
 
@@ -1012,11 +1061,8 @@ def main() -> None:
 
     try:
         cfg = get_config()
-
-        if args.mode == "live":
-            asyncio.run(main_async(args, cfg))
-        else:
-            main_sync(args, cfg)
+        if args.load_json_overrides:
+            cfg = BotConfig.load_json("bot_config.json")
 
     except KeyboardInterrupt:
         log.info("Interrompido pelo usuário")

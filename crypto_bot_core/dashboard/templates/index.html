@@ -89,6 +89,40 @@
             {% endif %}
         </div>
 
+        <div class="card">
+            <h3>⚙️ Ajustes de Risco (aplicação imediata)</h3>
+            <form id="risk-form" style="display:flex; flex-direction:column; gap:10px; margin-top:10px;">
+                <label>Stop Loss %: <input type="number" step="0.1" name="stop_loss_pct" value="{{ risk.get('stop_loss_pct', '') }}"></label>
+                <label>Take Profit %: <input type="number" step="0.1" name="take_profit_pct" value="{{ risk.get('take_profit_pct', '') }}"></label>
+                <label>Max Drawdown %: <input type="number" step="0.1" name="max_drawdown_pct" value="{{ risk.get('max_drawdown_pct', '') }}"></label>
+                <label>Max Open Trades: <input type="number" name="max_open_trades" value="{{ risk.get('max_open_trades', '') }}"></label>
+                <label>Enabled Strategies: <input type="text" name="enabled_strategies" value="{{ enabled_strategies }}"></label>
+                <button type="submit">Aplicar</button>
+                <span id="form-status"></span>
+            </form>
+        </div>
+
+        <script>
+        document.getElementById('risk-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const form = e.target;
+            const data = {};
+            new FormData(form).forEach((v, k) => { if (v !== '') data[k] = isNaN(v) ? v : Number(v); });
+            const status = document.getElementById('form-status');
+            try {
+                const resp = await fetch('/api/config', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(data)
+                });
+                const result = await resp.json();
+                status.textContent = resp.ok ? '✅ Aplicado' : '❌ Erro: ' + JSON.stringify(result);
+            } catch (err) {
+                status.textContent = '❌ Erro de rede';
+            }
+        });
+        </script>
+
         <div class="footer">
             Hyperliquid Production Bot v3.0
         </div>

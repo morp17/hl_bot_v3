@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from dotenv import dotenv_values
 from enum import Enum
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple
@@ -105,20 +106,20 @@ class RiskConfig(BaseModel):
     trailing_stop: bool = Field(False, description="Habilitar trailing stop")
     trailing_stop_activation_pct: float = Field(3.0, ge=0.5, le=30.0, description="Ativação do trailing stop (%)")
     trailing_stop_distance_pct: float = Field(0.5, ge=0.1, le=10.0, description="Distância do trailing stop (%)")
-    min_edge_vs_costs_mult: float = Field(1.5, ge=0.0, le=10.0, description="Múltiplo mínimo de edge vs custos")
-    liquidation_safety_buffer_pct: float = Field(20.0, ge=5.0, le=50.0, description="Buffer de segurança contra liquidação (%)")
     max_exposure_pct: float = Field(80.0, ge=10.0, le=100.0, description="Exposição máxima total (%)")
-    correlation_hedge_threshold: float = Field(0.7, ge=0.0, le=1.0, description="Threshold de correlação para hedge")
-    kelly_fraction: float = Field(0.25, ge=0.0, le=1.0, description="Fração de Kelly (0 = desativado)")
-    anti_martingale_mult: float = Field(1.0, ge=1.0, le=3.0, description="Multiplicador anti-martingale após win")
     circuit_breaker_loss_pct: float = Field(15.0, ge=1.0, le=50.0, description="Perda que aciona circuit breaker (%)")
     circuit_breaker_cooldown_sec: int = Field(3600, ge=60, le=86400, description="Cooldown do circuit breaker (segundos)")
     trade_hour_start_utc: int = Field(0, ge=0, le=23, description="Hora UTC de início para operar (0=desligado)")
     trade_hour_end_utc: int = Field(0, ge=0, le=23, description="Hora UTC de fim para operar (0=desligado)")
     max_spread_pct: float = Field(0.5, ge=0.01, le=5.0, description="Spread máximo permitido (%)")
     max_funding_rate: float = Field(0.1, ge=0.001, le=1.0, description="Funding rate máximo permitido (%)")
-    btc_crash_filter_pct: float = Field(0.0, ge=0.0, le=20.0, description="Filtro de crash BTC (0=desligado)")
     taker_fee: float = Field(0.0005, ge=0.0, le=0.01, description="Taxa taker da exchange")
+
+    # REMOVIDOS (não implementados em nenhum cálculo — ver auditoria item 4):
+    # min_edge_vs_costs_mult, correlation_hedge_threshold, kelly_fraction,
+    # anti_martingale_mult, btc_crash_filter_pct, liquidation_safety_buffer_pct
+    # (este último tinha equivalente hardcoded em risk.py:
+    # LIQUIDATION_SAFETY_BUFFER_PCT = 0.20, nunca lido de cfg.risk)
 
 
 class StakingConfig(BaseModel):
@@ -188,6 +189,53 @@ class BacktestConfig(BaseModel):
 # Config Principal
 # ──────────────────────────────────────────────
 
+def _cast_env_value(raw: str, annotation: Any) -> Any:
+    """Converte string de env var para o tipo declarado do campo Pydantic."""
+    if annotation is bool:
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    if annotation is int:
+        return int(raw)
+    if annotation is float:
+        return float(raw)
+    return raw
+
+
+def _apply_prefixed_env_overrides(
+    sub_model: BaseModel, prefix: str, env_values: Dict[str, Optional[str]]
+) -> None:
+    """
+    Popula campos de um sub-model a partir de env vars com prefixo dado,
+    contornando o parser automático de env_nested_delimiter do
+    pydantic-settings.
+
+    FIX (confirmado empiricamente): mesmo após remover default_factory
+    das sub-configs, valores como NOTIFICATIONS_TELEGRAM_BOT_TOKEN
+    continuavam chegando vazios em cfg.notifications.telegram_bot_token,
+    apesar do .env estar correto (validado via dotenv_values() lendo o
+    token corretamente). Causa: nomes de campo com múltiplos underscores
+    (ex: telegram_bot_token) tornam ambígua, para o parser automático,
+    a fronteira entre prefixo do sub-model e nome do campo — especialmente
+    com 6 prefixos concorrentes e case_sensitive=False.
+
+    Esta função lê o .env diretamente (independente da resolução interna
+    do pydantic-settings) e aplica manualmente cada campo, usando
+    correspondência exata de "{prefix}{NOME_DO_CAMPO_EM_MAIUSCULO}" —
+    sem ambiguidade de underscore.
+    """
+    for field_name, field_info in sub_model.model_fields.items():
+        env_key = f"{prefix}{field_name.upper()}"
+        raw_value = env_values.get(env_key)
+        if raw_value is None or raw_value == "":
+            continue
+        try:
+            casted = _cast_env_value(raw_value, field_info.annotation)
+            setattr(sub_model, field_name, casted)
+        except (ValueError, TypeError) as e:
+            log.warning(
+                f"[CONFIG] Não foi possível converter {env_key}="
+                f"'{raw_value}' para o tipo esperado: {e}"
+            )
+
 
 class BotConfig(BaseSettings):
     """
@@ -201,9 +249,6 @@ class BotConfig(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
-        # Permite carregar sub-modelos via env vars com prefixo
-        # Ex: RISK_STOP_LOSS_PCT → risk.stop_loss_pct
-        # Ex: NOTIFICATIONS_TELEGRAM_BOT_TOKEN → notifications.telegram_bot_token
         env_nested_delimiter="_",
     )
 
@@ -221,6 +266,12 @@ class BotConfig(BaseSettings):
     strategy: StrategyType = Field(StrategyType.HYBRID_REGIME, description="Estratégia principal")
     timeframe: Timeframe = Field(Timeframe.H1, description="Timeframe padrão")
 
+    # ── Estratégias habilitadas ──
+    enabled_strategies: str = Field(
+        "trend_follow,adaptive_trend,hybrid_regime",
+        description="Estratégias liberadas para operar ao vivo (CSV)."
+    )
+
     # ── Capital ──
     capital_usd: float = Field(1000.0, ge=10.0, le=1_000_000.0, description="Capital em USD")
     risk_per_trade_pct: float = Field(1.0, ge=0.1, le=10.0, description="Risco por trade (%)")
@@ -229,12 +280,24 @@ class BotConfig(BaseSettings):
     isolated_margin: bool = Field(True, description="Margem isolada")
 
     # ── Sub-configs ──
-    risk: RiskConfig = Field(default_factory=RiskConfig)
-    staking: StakingConfig = Field(default_factory=StakingConfig)
-    notifications: NotificationConfig = Field(default_factory=NotificationConfig)
-    dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
-    monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
-    backtest: BacktestConfig = Field(default_factory=BacktestConfig)
+    # FIX (auditoria — bug do pydantic-settings): default_factory=X faz o
+    # sub-model ser instanciado ANTES da camada de resolução de env vars
+    # (env_nested_delimiter) ter chance de popular seus campos internos,
+    # em algumas versões de pydantic-settings. Resultado prático: valores
+    # como NOTIFICATIONS_TELEGRAM_BOT_TOKEN no .env nunca chegavam a
+    # cfg.notifications.telegram_bot_token — o campo ficava com o default
+    # vazio "", silenciosamente (sem erro, sem log). Isso explicava alertas
+    # de Telegram configurados mas nunca disparados.
+    #
+    # Correção: instanciar diretamente (RiskConfig() em vez de
+    # Field(default_factory=RiskConfig)) — validado no próprio
+    # experimento _test_config.py do repositório ("Solução 2").
+    risk: RiskConfig = RiskConfig()
+    staking: StakingConfig = StakingConfig()
+    notifications: NotificationConfig = NotificationConfig()
+    dashboard: DashboardConfig = DashboardConfig()
+    monitoring: MonitoringConfig = MonitoringConfig()
+    backtest: BacktestConfig = BacktestConfig()
 
     # ── Internos (não expostos via env) ──
     _symbol_configs: List[SymbolConfig] = []
@@ -315,6 +378,33 @@ class BotConfig(BaseSettings):
                 log.warning("Mainnet detectado sem private key definida. O bot não conseguirá fazer ordens.")
             if not self.hyperliquid_account_address:
                 log.warning("Mainnet detectado sem account address definida.")
+        return self
+
+    @model_validator(mode="after")
+    def apply_nested_env_overrides(self) -> "BotConfig":
+        """
+        Sobrescreve manualmente as sub-configs aninhadas com os valores
+        reais do .env, contornando o bug de env_nested_delimiter (ver
+        _apply_prefixed_env_overrides). Roda DEPOIS que pydantic-settings
+        já tentou sua própria resolução automática — esta função corrige
+        qualquer campo que tenha ficado vazio incorretamente.
+        """
+        try:
+            env_file = self.model_config.get("env_file", ".env")
+            env_values = dotenv_values(env_file)
+
+            if not env_values:
+                return self
+
+            _apply_prefixed_env_overrides(self.risk, "RISK_", env_values)
+            _apply_prefixed_env_overrides(self.staking, "STAKING_", env_values)
+            _apply_prefixed_env_overrides(self.notifications, "NOTIFICATIONS_", env_values)
+            _apply_prefixed_env_overrides(self.dashboard, "DASHBOARD_", env_values)
+            _apply_prefixed_env_overrides(self.monitoring, "MONITORING_", env_values)
+            _apply_prefixed_env_overrides(self.backtest, "BACKTEST_", env_values)
+        except Exception as e:
+            log.error(f"[CONFIG] Erro ao aplicar overrides de env aninhados: {e}")
+
         return self
 
     # ──────────────────────────────────────────────
@@ -410,15 +500,72 @@ class BotConfig(BaseSettings):
 
     @classmethod
     def load_json(cls, path: str = "bot_config.json") -> "BotConfig":
-        """Carrega configuração de JSON e mescla com .env."""
+        """Carrega configuração de JSON e mescla com .env.
+
+        Suporta dois formatos de chave no JSON:
+        1. Campos de nível raiz (ex: "capital_usd", "leverage")
+        2. Sub-configs aninhadas como dict (ex: "risk": {"daily_loss_limit_pct": 5.0})
+
+        FIX (auditoria item 10): a versão anterior usava apenas
+        setattr(cfg, key, value) para cada chave do JSON, o que só
+        funciona para campos de nível raiz. Chaves com nomes que não
+        batem exatamente com um atributo de BotConfig (ex:
+        "max_daily_loss_pct" quando o campo real é
+        "risk.daily_loss_limit_pct") eram silenciosamente ignoradas
+        via hasattr() == False, sem log de aviso — o operador podia
+        editar o JSON acreditando que a configuração estava sendo
+        aplicada, quando na prática não estava.
+
+        Esta versão:
+        - Aplica corretamente sub-configs aninhadas quando fornecidas
+          como dict (risk, staking, notifications, dashboard,
+          monitoring, backtest).
+        - Loga um WARNING explícito para qualquer chave de nível raiz
+          que não corresponda a um campo real de BotConfig, em vez de
+          ignorar silenciosamente.
+        """
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            # Cria instância com env primeiro, depois sobrescreve com JSON
+
             cfg = cls()
+
+            # Nomes das sub-configs aninhadas conhecidas
+            nested_configs = {
+                "risk", "staking", "notifications", "dashboard",
+                "monitoring", "backtest",
+            }
+
+            unknown_keys: List[str] = []
+
             for key, value in data.items():
-                if hasattr(cfg, key) and value is not None:
+                if value is None:
+                    continue
+
+                if key in nested_configs and isinstance(value, dict):
+                    # Aplica campo a campo dentro da sub-config
+                    sub_cfg = getattr(cfg, key)
+                    for sub_key, sub_value in value.items():
+                        if hasattr(sub_cfg, sub_key):
+                            setattr(sub_cfg, sub_key, sub_value)
+                        else:
+                            unknown_keys.append(f"{key}.{sub_key}")
+                    continue
+
+                if hasattr(cfg, key):
                     setattr(cfg, key, value)
+                else:
+                    unknown_keys.append(key)
+
+            if unknown_keys:
+                log.warning(
+                    f"[CONFIG] {path}: chave(s) desconhecida(s) ignorada(s) "
+                    f"(não correspondem a nenhum campo de BotConfig): "
+                    f"{unknown_keys}. Verifique nomes/estrutura do JSON — "
+                    f"campos de risco ficam em 'risk': {{...}}, não no "
+                    f"nível raiz."
+                )
+
             log.info(f"Configuração carregada de {path}")
             return cfg
         except FileNotFoundError:

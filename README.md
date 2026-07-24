@@ -158,7 +158,19 @@ python main.py --mode live --interval 60
 python main.py --mode backtest --symbol BTC/USDC
 ```
 
-> ⚠️ **Nota:** O motor de backtest completo está em desenvolvimento. Atualmente exibe mensagem de placeholder.
+Executa o `BacktestEngine` sobre dados históricos reais buscados da
+exchange. Para validação de robustez temporal (múltiplas janelas
+sequenciais, sem reotimização de parâmetros entre elas), use
+`BacktestEngine.run_walk_forward()` programaticamente — ainda não
+exposto via CLI.
+
+> ⚠️ **Leia antes de confiar nos resultados**: o motor aplica
+> slippage configurável e checa SL/TP contra o range high/low de
+> cada barra (não apenas o close), mas quando ambos SL e TP são
+> tocados na mesma barra, o SL é assumido como o primeiro a ser
+> atingido — uma premissa conservadora, não um fato garantido sem
+> dados intrabar (tick/M1). Trate os resultados como estimativa,
+> não como garantia de performance futura.
 
 ### Modo Dashboard
 
@@ -181,7 +193,18 @@ Inicia o servidor web local para monitoramento (porta 8080 por padrão).
 
 ## 📈 Estratégias
 
-O bot implementa **7 estratégias** de trading, selecionáveis via `STRATEGY` no `.env`:
+O bot implementa **7 estratégias** de trading, selecionáveis via `STRATEGY` no `.env`.
+
+> ⚠️ **Nem todas estão liberadas para operar por padrão.** O controle
+> `ENABLED_STRATEGIES` (ver `.env.example`) restringe quais estratégias
+> podem gerar sinais reais. Por padrão, apenas `trend_follow`,
+> `adaptive_trend` e `hybrid_regime` estão habilitadas — as demais
+> (`mean_reversion`, `orderflow_delta`, `scalping_grid`,
+> `funding_arbitrage`) mostraram expectância negativa ou insuficiente
+> nos backtests de referência do repositório, ou dependem de dados
+> (funding rate) que exigem configuração adicional. Alterar
+> `STRATEGY=mean_reversion` sem também adicionar `mean_reversion` a
+> `ENABLED_STRATEGIES` resulta no bot retornando `hold` permanentemente.
 
 ### 1. Trend Follow (`trend_follow`)
 Segue tendência usando EMAs (9/21/200) + RSI + ADX.

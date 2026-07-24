@@ -34,6 +34,11 @@ from .config import BotConfig
 # ──────────────────────────────────────────────
 
 # Folga de segurança entre SL e preço de liquidação da exchange
+# NOTA: hardcoded intencionalmente — não confundir com o campo
+# RiskConfig.liquidation_safety_buffer_pct, que foi removido por
+# nunca ter sido de fato conectado a este valor (débito técnico
+# identificado na auditoria; se quiser tornar configurável no
+# futuro, seria necessário reintroduzir o campo E ler daqui).
 LIQUIDATION_SAFETY_BUFFER_PCT = 0.20
 
 # Número de consultas "posição ausente" antes de concluir fechamento externo
@@ -80,13 +85,20 @@ def calc_position_size(
     atr: float,
     risk_per_trade: float = 0.02,
     max_capital_pct: float = 0.20,
+    stop_loss_pct: float = 0.02,   # NOVO — precisa bater com o valor usado em calc_stops
 ) -> float:
     """
     Calcula o tamanho da posição usando risco percentual.
 
-    Usa Kelly simplificado: risco = balance * risk_per_trade.
-    Stop distance = max(atr * 2, price * 0.001).
-    Cap de 20% do capital por posição.
+    A distância de stop usada aqui é IDÊNTICA à usada em calc_stops():
+    max(price * stop_loss_pct, atr * 2). Isso garante que o risco em
+    dólares efetivamente exposto (qty * distância_real_do_stop) bata
+    com risk_per_trade nominal, e não apenas com uma estimativa
+    desacoplada do stop real que será colocado na ordem.
+
+    NOTA: se calc_stops() usar SL estrutural (swing low/high), a
+    distância real pode divergir desta estimativa em até 3x — isso é
+    uma limitação conhecida, não citar como "risco exato garantido".
 
     Args:
         balance: Saldo disponível em USDC.
@@ -94,6 +106,8 @@ def calc_position_size(
         atr: ATR (Average True Range).
         risk_per_trade: Fração do capital a arriscar (ex: 0.02 = 2%).
         max_capital_pct: Fração máxima do capital por posição.
+        stop_loss_pct: Percentual de stop — DEVE ser o mesmo valor
+            passado depois para calc_stops() no mesmo ciclo de entrada.
 
     Returns:
         float: Quantidade calculada (arredondada para 6 casas).
@@ -104,7 +118,7 @@ def calc_position_size(
             return 0.0
 
         risk_amt = balance * risk_per_trade
-        stop_dist = max(atr * 2, price * 0.001)
+        stop_dist = max(price * stop_loss_pct, atr * 2)  # ALTERADO: era max(atr*2, price*0.001)
         qty_risk = risk_amt / stop_dist
         max_qty = (balance * max_capital_pct) / price
         qty = min(qty_risk, max_qty)
@@ -273,21 +287,13 @@ class PositionManager:
         trailing_activation_pct: float = 0.02,
         trailing_stop_pct: float = 0.01,
         taker_fee: float = 0.0005,
+        max_position_pct: float = 0.20,   # NOVO
     ) -> None:
         """
-        Inicializa o PositionManager.
-
-        Args:
-            capital_usd: Capital inicial em USD.
-            max_open_trades: Máximo de trades simultâneos.
-            max_drawdown_pct: Drawdown máximo permitido.
-            daily_loss_limit_pct: Limite de perda diária.
-            max_consecutive_losses: Máximo de perdas consecutivas.
-            cooldown_after_loss_sec: Cooldown após perda (segundos).
-            trailing_stop: Habilitar trailing stop.
-            trailing_activation_pct: Percentual de ativação do trailing.
-            trailing_stop_pct: Percentual do trailing stop.
-            taker_fee: Taxa taker da exchange.
+        ...(docstring existente)...
+            max_position_pct: Fração máxima do capital por posição
+                (deve refletir cfg.max_position_pct/100.0 — usado para
+                calcular exposição máxima total em can_open()).
         """
         self.max_open_trades = max_open_trades
         self.max_drawdown_pct = max_drawdown_pct
@@ -298,6 +304,7 @@ class PositionManager:
         self.trailing_activation_pct = trailing_activation_pct
         self.trailing_stop_pct = trailing_stop_pct
         self.taker_fee = taker_fee
+        self.max_position_pct = max_position_pct   # NOVO
 
         self.positions: List[Position] = []
         self.pnl_today = 0.0
@@ -383,14 +390,14 @@ class PositionManager:
                     p.qty * p.entry_price for p in self.positions
                 )
                 exposure_pct = total_exposure / max(self.current_balance, 1)
-                max_exposure = self.max_open_trades * 0.20
+                max_exposure = self.max_open_trades * self.max_position_pct   # ALTERADO: era * 0.20
                 if exposure_pct >= max_exposure * 0.95:
                     log.info(
                         f"[RISCO] Exposição total {exposure_pct:.1%} "
                         f"próxima do limite ({max_exposure:.0%})"
                     )
                     return False, f"exposure_{exposure_pct:.1%}"
-
+                
             return True, "ok"
 
         except Exception as e:

@@ -89,6 +89,41 @@ def _safe_series_op(series: pd.Series, operation: str = "mean") -> float:
         return 0.0
 
 
+def add_funding_rate(df: pd.DataFrame, funding_rate: Optional[float] = None) -> pd.DataFrame:
+    """
+    Adiciona a coluna funding_rate ao DataFrame.
+
+    O funding rate não é derivável de OHLCV — deve ser buscado
+    externamente (ex: HyperliquidConnector.get_mark_price() /
+    Info.meta_and_asset_ctxs()) e passado como escalar aqui.
+
+    Em backtest histórico, funding_rate por barra normalmente não
+    está disponível sem uma chamada separada a funding_history();
+    por padrão, se None, a coluna fica ausente e
+    signal_funding_arbitrage() retorna hold (comportamento seguro,
+    não gera falso sinal).
+
+    Args:
+        df: DataFrame OHLCV.
+        funding_rate: Taxa de funding atual (escalar). Se None,
+            a coluna não é adicionada.
+
+    Returns:
+        DataFrame com a coluna funding_rate (broadcast do escalar)
+        se funding_rate foi fornecido; inalterado caso contrário.
+    """
+    try:
+        if funding_rate is None:
+            return df
+        if not _validate_dataframe(df):
+            return df
+        df["funding_rate"] = float(funding_rate)
+        return df
+    except Exception as e:
+        log.error(f"Erro ao adicionar funding_rate: {e}")
+        return df
+
+
 # ──────────────────────────────────────────────
 # Indicadores Base
 # ──────────────────────────────────────────────
@@ -119,17 +154,6 @@ def add_ema(df: pd.DataFrame, period: int, col_name: str = None) -> pd.DataFrame
 
 
 def add_rsi(df: pd.DataFrame, period: int = 14, col_name: str = "rsi") -> pd.DataFrame:
-    """
-    Adiciona RSI ao DataFrame.
-
-    Args:
-        df: DataFrame com coluna 'close'.
-        period: Período do RSI.
-        col_name: Nome da coluna.
-
-    Returns:
-        DataFrame com RSI adicionada.
-    """
     try:
         if not _validate_dataframe(df, ["close"]):
             return df
@@ -143,7 +167,9 @@ def add_rsi(df: pd.DataFrame, period: int = 14, col_name: str = "rsi") -> pd.Dat
 
         rs = avg_gain / avg_loss.replace(0, np.nan)
         df[col_name] = 100.0 - (100.0 / (1.0 + rs))
-        df[col_name] = df[col_name].fillna(50.0)
+        # ALTERADO: quando avg_loss==0 (só ganhos), RSI correto é 100, não 50
+        df[col_name] = df[col_name].where(avg_loss != 0, 100.0)
+        df[col_name] = df[col_name].fillna(50.0)  # fallback para NaN genuíno (ex: warm-up)
 
         return df
     except Exception as e:
@@ -483,13 +509,22 @@ def add_orderflow(
 # ──────────────────────────────────────────────
 
 
-def add_all_indicators(df: pd.DataFrame, cfg: BotConfig) -> pd.DataFrame:
+def add_all_indicators(
+    df: pd.DataFrame,
+    cfg: BotConfig,
+    funding_rate: Optional[float] = None,   # NOVO
+) -> pd.DataFrame:
     """
     Adiciona todos os indicadores necessários ao DataFrame.
 
     Args:
         df: DataFrame com colunas OHLCV.
         cfg: Configuração do bot (para parâmetros de estratégia).
+        funding_rate: Taxa de funding atual, buscada externamente
+            (ex: connector.get_mark_price / meta_and_asset_ctxs).
+            Necessário apenas se a estratégia funding_arbitrage
+            estiver habilitada; None preserva o comportamento
+            anterior (estratégia retorna hold).
 
     Returns:
         DataFrame com todos os indicadores.
@@ -533,6 +568,9 @@ def add_all_indicators(df: pd.DataFrame, cfg: BotConfig) -> pd.DataFrame:
         # CVD e OrderFlow
         df = add_cvd(df)
         df = add_orderflow(df, 10)
+
+        # Funding Rate (NOVO — só popula se fornecido externamente)
+        df = add_funding_rate(df, funding_rate)
 
         log.info(f"Indicadores calculados: {len(df.columns)} colunas")
         return df

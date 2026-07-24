@@ -975,6 +975,46 @@ class HyperliquidConnector:
             log.error(f"Erro ao buscar mark price para {coin}: {e}")
             return None
 
+    def get_current_funding_rate(self, coin: str) -> Optional[float]:
+        """
+        Obtém o funding rate atual (não histórico) de um ativo via
+        metaAndAssetCtxs.
+
+        Diferente de get_funding_history(), que retorna uma série
+        histórica, este método retorna a taxa vigente no momento,
+        útil para:
+        - Alimentar indicators.add_funding_rate() no ciclo ao vivo
+        - Alimentar capital_protection.check_funding_rate()
+
+        Args:
+            coin: Nome do ativo (ex: "ETH").
+
+        Returns:
+            float: Funding rate atual (ex: 0.0001 = 0.01%) ou None
+                se indisponível.
+        """
+        try:
+            coin = coin.split("/")[0].split(":")[0]
+
+            meta_and_ctxs = self.info.meta_and_asset_ctxs()
+            if meta_and_ctxs and len(meta_and_ctxs) == 2:
+                meta, asset_ctxs = meta_and_ctxs
+                universe = meta.get("universe", [])
+                for i, asset in enumerate(universe):
+                    if asset.get("name") == coin:
+                        funding_raw = asset_ctxs[i].get("funding")
+                        if funding_raw is not None:
+                            funding = float(funding_raw)
+                            log.debug(f"Funding rate atual {coin}: {funding}")
+                            return funding
+                        break
+
+            log.warning(f"Funding rate não encontrado para {coin} em metaAndAssetCtxs")
+            return None
+        except Exception as e:
+            log.error(f"Erro ao buscar funding rate atual para {coin}: {e}")
+            return None    
+
     def get_funding_history(self, coin: str, start_time: int, end_time: Optional[int] = None) -> List[Any]:
         """Retorna histórico de funding."""
         try:
