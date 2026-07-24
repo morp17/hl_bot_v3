@@ -269,8 +269,25 @@ class BotConfig(BaseSettings):
     # ── Estratégias habilitadas ──
     enabled_strategies: str = Field(
         "trend_follow,adaptive_trend,hybrid_regime",
-        description="Estratégias liberadas para operar ao vivo (CSV)."
+        description="Estratégias liberadas para operar ao vivo (CSV). "
+                     "mean_reversion/orderflow_delta/scalping_grid/funding_arbitrage "
+                     "requerem validação walk-forward antes de habilitar."
     )
+
+    @field_validator("enabled_strategies")
+    @classmethod
+    def validate_enabled_strategies(cls, v: str) -> str:
+        valid = {s.value for s in StrategyType}
+        strategies = [s.strip() for s in v.split(",") if s.strip()]
+        for s in strategies:
+            if s not in valid:
+                raise ValueError(f"Estratégia desconhecida em enabled_strategies: {s}")
+        return v
+
+    def is_strategy_enabled(self, strategy: Optional[StrategyType] = None) -> bool:
+        """Verifica se a estratégia (atual ou informada) está liberada para operar."""
+        strat = (strategy or self.strategy).value
+        return strat in [s.strip() for s in self.enabled_strategies.split(",")]
 
     # ── Capital ──
     capital_usd: float = Field(1000.0, ge=10.0, le=1_000_000.0, description="Capital em USD")
@@ -278,6 +295,10 @@ class BotConfig(BaseSettings):
     max_position_pct: float = Field(20.0, ge=0.1, le=100.0, description="Tamanho máximo da posição (%)")
     leverage: int = Field(3, ge=1, le=50, description="Alavancagem")
     isolated_margin: bool = Field(True, description="Margem isolada")
+
+    # ── Dashboard ──
+    dashboard_enabled: bool = Field(True, description="Habilita o dashboard web (thread em background dentro do processo live)")
+
 
     # ── Sub-configs ──
     # FIX (auditoria — bug do pydantic-settings): default_factory=X faz o

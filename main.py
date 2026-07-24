@@ -117,7 +117,6 @@ class HyperliquidBot:
             trade_hour_end_utc=r.trade_hour_end_utc,
             max_spread_pct=r.max_spread_pct / 100.0,
             max_funding_rate=r.max_funding_rate / 100.0,
-            btc_crash_filter_pct=r.btc_crash_filter_pct / 100.0,
         )
         self.notificator = Notificator(
     telegram_token=n.telegram_bot_token or None,   # sempre None se o bug ocorrer
@@ -1063,6 +1062,11 @@ def main() -> None:
         cfg = get_config()
         if args.load_json_overrides:
             cfg = BotConfig.load_json("bot_config.json")
+
+        if args.mode == "live":
+            asyncio.run(main_async(args, cfg))
+        else:
+            main_sync(args, cfg)
 
     except KeyboardInterrupt:
         log.info("Interrompido pelo usuário")
