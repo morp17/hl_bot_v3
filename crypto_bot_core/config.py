@@ -592,7 +592,7 @@ class BotConfig(BaseSettings):
         except FileNotFoundError:
             log.warning(f"Arquivo {path} não encontrado, usando defaults")
             return cls()
-        except (json.JSONDecodeError, OSError) as e:
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:   # ALTERADO: + UnicodeDecodeError
             log.error(f"Erro ao carregar {path}: {e}")
             return cls()
 

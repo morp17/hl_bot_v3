@@ -290,7 +290,19 @@ class PositionManager:
         max_position_pct: float = 0.20,   # NOVO
     ) -> None:
         """
-        ...(docstring existente)...
+        Inicializa o gerenciador de posições.
+
+        Args:
+            capital_usd: Capital inicial em USD.
+            max_open_trades: Máximo de trades simultâneos.
+            max_drawdown_pct: Drawdown máximo permitido (fração, ex: 0.20 = 20%).
+            daily_loss_limit_pct: Limite de perda diária (fração).
+            max_consecutive_losses: Máximo de perdas consecutivas antes de pausar.
+            cooldown_after_loss_sec: Cooldown após perda (segundos).
+            trailing_stop: Se True, habilita trailing stop.
+            trailing_activation_pct: Lucro percentual mínimo para ativar o trailing.
+            trailing_stop_pct: Distância do trailing stop em relação ao preço.
+            taker_fee: Taxa taker da exchange (fração).
             max_position_pct: Fração máxima do capital por posição
                 (deve refletir cfg.max_position_pct/100.0 — usado para
                 calcular exposição máxima total em can_open()).
@@ -397,7 +409,7 @@ class PositionManager:
                         f"próxima do limite ({max_exposure:.0%})"
                     )
                     return False, f"exposure_{exposure_pct:.1%}"
-                
+
             return True, "ok"
 
         except Exception as e:
@@ -449,6 +461,23 @@ class PositionManager:
         """
         Verifica se alguma posição atingiu SL, TP ou trailing.
 
+        FIX CRÍTICO #1 (auditoria, achado em teste ao vivo): a checagem
+        de trailing stop rodava incondicionalmente, sem verificar se
+        self.trailing_stop estava de fato habilitado, e sem verificar
+        se pos.trailing_stop_price já havia sido inicializado com um
+        valor válido (>0). Corrigido abaixo.
+
+        FIX CRÍTICO #2 (auditoria, segundo achado em teste ao vivo):
+        posições RESTAURADAS de uma sessão anterior via
+        main.py::_sync_from_exchange() são criadas sem stop_loss/
+        take_profit (ambos ficam no default 0.0 da dataclass Position,
+        pois esse dado não é buscado de volta da exchange). Para uma
+        posição SELL, 'price >= stop_loss' com stop_loss=0.0 é SEMPRE
+        verdadeiro — fechando a posição no ciclo seguinte à restauração,
+        rotulado incorretamente como "SL atingido" mesmo sem o preço
+        ter se movido. Guarda abaixo: só avalia hit_sl/hit_tp quando o
+        respectivo valor foi de fato inicializado (>0).
+
         Args:
             price: Preço atual.
 
@@ -458,18 +487,31 @@ class PositionManager:
         try:
             to_close: List[Position] = []
             for pos in self.positions:
-                hit_tp = (
-                    (pos.side == "buy" and price >= pos.take_profit)
-                    or (pos.side == "sell" and price <= pos.take_profit)
-                )
-                hit_sl = (
-                    (pos.side == "buy" and price <= pos.stop_loss)
-                    or (pos.side == "sell" and price >= pos.stop_loss)
-                )
-                hit_tr = (
-                    (pos.side == "buy" and price <= pos.trailing_stop_price)
-                    or (pos.side == "sell" and price >= pos.trailing_stop_price)
-                )
+                # FIX: só avalia TP/SL se tiverem sido inicializados
+                # (>0) — evita fechamento espúrio de posições com
+                # stop_loss/take_profit ainda no default 0.0 (ex:
+                # restauradas via sync sem essa informação).
+                hit_tp = False
+                if pos.take_profit > 0:
+                    hit_tp = (
+                        (pos.side == "buy" and price >= pos.take_profit)
+                        or (pos.side == "sell" and price <= pos.take_profit)
+                    )
+                hit_sl = False
+                if pos.stop_loss > 0:
+                    hit_sl = (
+                        (pos.side == "buy" and price <= pos.stop_loss)
+                        or (pos.side == "sell" and price >= pos.stop_loss)
+                    )
+
+                # FIX: só avalia trailing se estiver habilitado E já
+                # tiver um trailing_stop_price válido (>0).
+                hit_tr = False
+                if self.trailing_stop and pos.trailing_stop_price > 0:
+                    hit_tr = (
+                        (pos.side == "buy" and price <= pos.trailing_stop_price)
+                        or (pos.side == "sell" and price >= pos.trailing_stop_price)
+                    )
 
                 if hit_tp:
                     log.info(f"[TP] {pos.symbol} @ {price}")
@@ -480,6 +522,15 @@ class PositionManager:
                 elif hit_tr:
                     log.info(f"[TRAIL] {pos.symbol} @ {price}")
                     to_close.append(pos)
+
+                if pos.stop_loss <= 0 and pos.take_profit <= 0:
+                    log.warning(
+                        f"[EXITS] {pos.symbol} sem SL/TP definidos "
+                        f"(provavelmente restaurada via sync) — posição "
+                        f"NÃO tem proteção de stop até ser corrigido "
+                        f"manualmente ou até _sync_from_exchange popular "
+                        f"esses valores a partir das ordens reais na DEX."
+                    )
 
             return to_close
 

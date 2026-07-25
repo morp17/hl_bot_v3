@@ -54,7 +54,15 @@ def sample_df() -> pd.DataFrame:
 
 @pytest.fixture
 def pm() -> PositionManager:
-    """PositionManager com configuração padrão."""
+    """PositionManager com configuração padrão.
+
+    FIX (item 4 auditoria): max_position_pct agora é passado
+    explicitamente — antes can_open() usava um hardcode de 0.20
+    desconectado da configuração real. Aqui usamos 0.20 propositalmente
+    igual ao valor legado, para que os testes de exposição abaixo
+    continuem com os mesmos números esperados; test_max_position_pct_respected
+    cobre o caso onde o valor É diferente do hardcode antigo.
+    """
     return PositionManager(
         capital_usd=10000.0,
         max_open_trades=3,
@@ -62,6 +70,7 @@ def pm() -> PositionManager:
         daily_loss_limit_pct=0.10,
         max_consecutive_losses=5,
         cooldown_after_loss_sec=300,
+        max_position_pct=0.20,
     )
 
 
@@ -125,10 +134,18 @@ class TestCalcPositionSize:
     """Testes para calc_position_size."""
 
     def test_basic_sizing(self) -> None:
-        """Deve calcular tamanho básico."""
-        qty = calc_position_size(balance=10000, price=50000, atr=1000, risk_per_trade=0.02)
+        """
+        FIX (item 2 auditoria): stop_dist agora usa
+        max(price*stop_loss_pct, atr*2) — a MESMA fórmula de calc_stops,
+        não mais max(atr*2, price*0.001). Isso garante que o risco em
+        dólares efetivamente exposto bata com risk_per_trade nominal.
+        """
+        qty = calc_position_size(
+            balance=10000, price=50000, atr=1000, risk_per_trade=0.02,
+            stop_loss_pct=0.02,
+        )
         # risk_amt = 10000 * 0.02 = 200
-        # stop_dist = max(1000*2, 50000*0.001) = max(2000, 50) = 2000
+        # stop_dist = max(50000*0.02, 1000*2) = max(1000, 2000) = 2000
         # qty_risk = 200 / 2000 = 0.1
         # max_qty = (10000 * 0.20) / 50000 = 0.04
         # qty = min(0.1, 0.04) = 0.04
@@ -149,23 +166,65 @@ class TestCalcPositionSize:
     def test_custom_risk(self) -> None:
         """Deve usar risk_per_trade personalizado."""
         qty = calc_position_size(
-            balance=10000, price=50000, atr=1000, risk_per_trade=0.05
+            balance=10000, price=50000, atr=1000, risk_per_trade=0.05,
+            stop_loss_pct=0.02,
         )
         # risk_amt = 10000 * 0.05 = 500
-        # stop_dist = 2000
+        # stop_dist = max(1000, 2000) = 2000
         # qty_risk = 500 / 2000 = 0.25
         # max_qty = 0.04
         # qty = min(0.25, 0.04) = 0.04
         assert qty == 0.04
 
-    def test_small_atr(self) -> None:
-        """Deve usar price*0.001 quando ATR é muito pequeno."""
-        qty = calc_position_size(balance=10000, price=50000, atr=1, risk_per_trade=0.02)
-        # stop_dist = max(2, 50) = 50
-        # qty_risk = 200 / 50 = 4.0
+    def test_small_atr_uses_pct_floor(self) -> None:
+        """
+        FIX (item 2): quando ATR é muito pequeno, o piso de distância
+        de stop agora vem de price*stop_loss_pct (mesma fórmula de
+        calc_stops), não mais de price*0.001 fixo.
+        """
+        qty = calc_position_size(
+            balance=10000, price=50000, atr=1, risk_per_trade=0.02,
+            stop_loss_pct=0.02,
+        )
+        # stop_dist = max(50000*0.02, 1*2) = max(1000, 2) = 1000
+        # qty_risk = 200 / 1000 = 0.2
         # max_qty = 0.04
-        # qty = min(4.0, 0.04) = 0.04
+        # qty = min(0.2, 0.04) = 0.04
         assert qty == 0.04
+
+    def test_default_stop_loss_pct_backward_compat(self) -> None:
+        """
+        Sem stop_loss_pct explícito, deve usar o default (0.02) da
+        assinatura — chamadas legadas que não passam o parâmetro não
+        devem quebrar.
+        """
+        qty = calc_position_size(balance=10000, price=50000, atr=1000, risk_per_trade=0.02)
+        assert qty > 0
+
+    def test_stop_loss_pct_affects_sizing(self) -> None:
+        """
+        Fórmula unificada: aumentar stop_loss_pct aumenta a distância
+        de stop assumida, reduzindo qty_risk (menos alavancado por
+        posição para o mesmo risco em $).
+        """
+        qty_tight = calc_position_size(
+            balance=10000, price=50000, atr=100, risk_per_trade=0.02,
+            stop_loss_pct=0.01, max_capital_pct=1.0,  # sem cap de capital para isolar o efeito
+        )
+        qty_wide = calc_position_size(
+            balance=10000, price=50000, atr=100, risk_per_trade=0.02,
+            stop_loss_pct=0.05, max_capital_pct=1.0,
+        )
+        assert qty_tight > qty_wide
+
+    def test_max_capital_pct_caps_qty(self) -> None:
+        """max_capital_pct deve continuar limitando o teto de qty."""
+        qty = calc_position_size(
+            balance=10000, price=50000, atr=1000, risk_per_trade=0.50,
+            stop_loss_pct=0.02, max_capital_pct=0.05,
+        )
+        max_qty = (10000 * 0.05) / 50000
+        assert qty == round(max_qty, 6)
 
 
 # ──────────────────────────────────────────────
@@ -232,6 +291,27 @@ class TestCalcStops:
         assert tp > 0
         assert sl < 100  # SL abaixo do preço para compra
         assert tp > 100  # TP acima do preço para compra
+
+    def test_calc_stops_and_calc_position_size_share_formula(self) -> None:
+        """
+        REGRESSÃO (item 2 auditoria): a distância de stop assumida por
+        calc_position_size deve bater com a distância de stop
+        percentual/ATR usada por calc_stops (sem considerar o SL
+        estrutural, que é uma camada adicional só de calc_stops).
+        Isso garante que o risco em $ nominal (risk_per_trade) e o
+        risco em $ real (qty * distância do SL) fiquem alinhados
+        quando o SL estrutural não entra em jogo.
+        """
+        price, atr, stop_loss_pct = 50000.0, 1000.0, 0.02
+
+        sl, _ = calc_stops(price=price, side="buy", atr=atr, stop_loss_pct=stop_loss_pct)
+        stop_dist_from_calc_stops = price - sl
+
+        # calc_position_size usa a mesma fórmula internamente:
+        # max(price*stop_loss_pct, atr*2)
+        expected_stop_dist = max(price * stop_loss_pct, atr * 2)
+
+        assert stop_dist_from_calc_stops == expected_stop_dist
 
 
 # ──────────────────────────────────────────────
@@ -305,6 +385,20 @@ class TestPositionManagerInit:
         assert pm.max_drawdown_pct == 0.30
         assert pm.daily_loss_limit_pct == 0.15
 
+    def test_init_max_position_pct_default(self) -> None:
+        """
+        FIX (item 4 auditoria): max_position_pct deve ser aceito no
+        construtor com default sensato (0.20), para não quebrar
+        chamadas legadas sem esse parâmetro.
+        """
+        pm = PositionManager(capital_usd=10000)
+        assert pm.max_position_pct == 0.20
+
+    def test_init_max_position_pct_custom(self) -> None:
+        """max_position_pct customizado deve ser respeitado."""
+        pm = PositionManager(capital_usd=10000, max_position_pct=0.05)
+        assert pm.max_position_pct == 0.05
+
 
 class TestPositionManagerCanOpen:
     """Testes para PositionManager.can_open."""
@@ -364,6 +458,43 @@ class TestPositionManagerCanOpen:
         ok, reason = pm.can_open()
         assert ok is True
         assert reason == "ok"
+
+    def test_max_exposure_uses_configured_max_position_pct(self) -> None:
+        """
+        FIX (item 4 auditoria): can_open() deve calcular max_exposure
+        usando self.max_position_pct (configurado), não mais um
+        hardcode fixo de 0.20 desconectado da config real. Aqui usamos
+        um valor DIFERENTE do hardcode legado (0.05) para provar que
+        o parâmetro está de fato sendo respeitado.
+        """
+        pm = PositionManager(
+            capital_usd=10000,
+            max_open_trades=3,
+            max_position_pct=0.05,  # bem menor que o hardcode legado de 0.20
+        )
+        # max_exposure = max_open_trades * max_position_pct = 3*0.05 = 0.15
+        # threshold de bloqueio = max_exposure * 0.95 = 0.1425 (14.25% do capital)
+        # Exposição desta posição: (2000 * 1.0) / 10000 = 20% > 14.25% -> deve bloquear.
+        # Com o hardcode legado (0.20 fixo, ignorando max_position_pct=0.05),
+        # o threshold seria 3*0.20*0.95=0.57 (57%), e esta mesma posição
+        # NÃO bloquearia — é exatamente essa diferença que prova que o
+        # parâmetro configurado está sendo respeitado, não o hardcode antigo.
+        pm.add(Position(symbol="BTC/USDC", side="buy", entry_price=2000.0, qty=1.0))
+        ok, reason = pm.can_open()
+        assert ok is False
+        assert "exposure" in reason
+
+    def test_max_exposure_with_default_hardcode_equivalent(self, pm: PositionManager) -> None:
+        """
+        Com max_position_pct=0.20 (fixture pm), o comportamento deve
+        bater com o legado: só bloqueia perto de max_open_trades*0.20
+        de exposição total.
+        """
+        # 3 posições * 0.20 = 60% de exposição máxima teórica;
+        # colocando uma exposição bem abaixo disso não deve bloquear.
+        pm.add(Position(symbol="BTC/USDC", side="buy", entry_price=1000.0, qty=1.0))
+        ok, reason = pm.can_open()
+        assert ok is True
 
 
 class TestPositionManagerAdd:
@@ -501,3 +632,20 @@ class TestPositionManagerToDict:
         d = pm.to_dict()
         assert len(d["positions"]) == 1
         assert d["positions"][0]["symbol"] == "BTC/USDC"
+
+
+class TestLiquidationSafetyBufferConstant:
+    """
+    Testa que LIQUIDATION_SAFETY_BUFFER_PCT continua existindo como
+    constante hardcoded de módulo (não como campo de RiskConfig,
+    removido no item 6 por nunca ter sido de fato conectado a ela).
+    """
+
+    def test_constant_exists_and_has_expected_value(self) -> None:
+        assert LIQUIDATION_SAFETY_BUFFER_PCT == 0.20
+
+    def test_constant_is_module_level_not_config_field(self) -> None:
+        """RiskConfig não deve ter esse campo — é intencionalmente hardcoded."""
+        from crypto_bot_core.config import RiskConfig
+        rc = RiskConfig()
+        assert not hasattr(rc, "liquidation_safety_buffer_pct")
