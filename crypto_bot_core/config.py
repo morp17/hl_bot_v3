@@ -44,6 +44,8 @@ class StrategyType(str, Enum):
     ORDERFLOW_DELTA = "orderflow_delta"
     SCALPING_GRID = "scalping_grid"
     FUNDING_ARBITRAGE = "funding_arbitrage"
+    VOLATILITY_SQUEEZE = "volatility_squeeze"          # NOVA
+    FUNDING_WEIGHTED_TREND = "funding_weighted_trend"   # NOVA
 
 
 class Timeframe(str, Enum):
@@ -106,20 +108,56 @@ class RiskConfig(BaseModel):
     trailing_stop: bool = Field(False, description="Habilitar trailing stop")
     trailing_stop_activation_pct: float = Field(3.0, ge=0.5, le=30.0, description="Ativação do trailing stop (%)")
     trailing_stop_distance_pct: float = Field(0.5, ge=0.1, le=10.0, description="Distância do trailing stop (%)")
-    max_exposure_pct: float = Field(80.0, ge=10.0, le=100.0, description="Exposição máxima total (%)")
+    max_exposure_pct: float = Field(80.0, ge=10.0, le=100.0, description="Exposição bruta máxima total (%)")
+    max_correlated_exposure_pct: float = Field(
+        60.0, ge=10.0, le=100.0,
+        description=(
+            "Exposição direcional máxima agregada (%) entre símbolos "
+            "tratados como correlacionados. Por padrão, trata TODOS os "
+            "símbolos operados pelo bot como um único grupo de "
+            "correlação. Defina 100.0 para desabilitar esta proteção."
+        ),
+    )
     circuit_breaker_loss_pct: float = Field(15.0, ge=1.0, le=50.0, description="Perda que aciona circuit breaker (%)")
     circuit_breaker_cooldown_sec: int = Field(3600, ge=60, le=86400, description="Cooldown do circuit breaker (segundos)")
     trade_hour_start_utc: int = Field(0, ge=0, le=23, description="Hora UTC de início para operar (0=desligado)")
     trade_hour_end_utc: int = Field(0, ge=0, le=23, description="Hora UTC de fim para operar (0=desligado)")
     max_spread_pct: float = Field(0.5, ge=0.01, le=5.0, description="Spread máximo permitido (%)")
-    max_funding_rate: float = Field(0.1, ge=0.001, le=1.0, description="Funding rate máximo permitido (%)")
+    max_funding_rate: float = Field(
+        0.1, ge=0.001, le=1.0,
+        description=(
+            "Funding rate máximo permitido, em PONTOS PERCENTUAIS "
+            "(ex: 0.1 = 0.1%, não 10%). É convertido para fração "
+            "(dividido por 100) antes de ser usado em CapitalProtection "
+            "— use max_funding_rate_fraction (property abaixo) em vez "
+            "de dividir manualmente por 100 em código novo. "
+            "NOTA DE ESCALA: este campo usa unidade DIFERENTE da usada "
+            "em STRATEGY_DEFAULTS['funding_arbitrage']['max_funding_rate'] "
+            "(0.01), que já é uma fração direta (1%) comparada "
+            "diretamente contra o funding_rate bruto da exchange — são "
+            "dois parâmetros com propósitos distintos (filtro de "
+            "proteção de capital vs. limiar de sinal de estratégia), "
+            "não devem ser confundidos nem unificados sem revisar ambos "
+            "os pontos de uso."
+        ),
+    )
     taker_fee: float = Field(0.0005, ge=0.0, le=0.01, description="Taxa taker da exchange")
 
-    # REMOVIDOS (não implementados em nenhum cálculo — ver auditoria item 4):
-    # min_edge_vs_costs_mult, correlation_hedge_threshold, kelly_fraction,
-    # anti_martingale_mult, btc_crash_filter_pct, liquidation_safety_buffer_pct
-    # (este último tinha equivalente hardcoded em risk.py:
-    # LIQUIDATION_SAFETY_BUFFER_PCT = 0.20, nunca lido de cfg.risk)
+    @property
+    def max_funding_rate_fraction(self) -> float:
+        """
+        Retorna max_funding_rate convertido de pontos percentuais para
+        fração (ex: 0.1 -> 0.001), pronto para uso direto em
+        CapitalProtection.max_funding_rate ou qualquer comparação contra
+        funding_rate bruto retornado pela exchange (que já vem em fração,
+        ex: 0.0001 = 0.01%).
+
+        FIX (item 2 da auditoria — inconsistência de escala): esta
+        property centraliza a única conversão correta, eliminando a
+        divisão manual "/100" que antes só existia inline em main.py
+        (fácil de esquecer/duplicar incorretamente em código futuro).
+        """
+        return self.max_funding_rate / 100.0
 
 
 class StakingConfig(BaseModel):
@@ -157,8 +195,8 @@ class DashboardConfig(BaseModel):
 
     host: str = Field("0.0.0.0", description="Host do dashboard")
     port: int = Field(8080, ge=1024, le=65535, description="Porta do dashboard")
-    user: str = Field("admin", description="Usuário do dashboard")
-    password: str = Field("changeme", description="Senha do dashboard", min_length=4)
+    user: str = Field("admin", description="Usuário do dashboard (HTTP Basic Auth)")
+    password: str = Field("changeme", description="Senha do dashboard (HTTP Basic Auth)", min_length=4)
     session_secret: str = Field("", description="Chave secreta para sessões")
 
 
@@ -204,23 +242,26 @@ def _apply_prefixed_env_overrides(
     sub_model: BaseModel, prefix: str, env_values: Dict[str, Optional[str]]
 ) -> None:
     """
-    Popula campos de um sub-model a partir de env vars com prefixo dado,
-    contornando o parser automático de env_nested_delimiter do
-    pydantic-settings.
+    Popula campos de um sub-model a partir de valores de ambiente com
+    prefixo dado, contornando o parser automático de
+    env_nested_delimiter do pydantic-settings.
 
     FIX (confirmado empiricamente): mesmo após remover default_factory
     das sub-configs, valores como NOTIFICATIONS_TELEGRAM_BOT_TOKEN
     continuavam chegando vazios em cfg.notifications.telegram_bot_token,
-    apesar do .env estar correto (validado via dotenv_values() lendo o
-    token corretamente). Causa: nomes de campo com múltiplos underscores
-    (ex: telegram_bot_token) tornam ambígua, para o parser automático,
-    a fronteira entre prefixo do sub-model e nome do campo — especialmente
-    com 6 prefixos concorrentes e case_sensitive=False.
+    apesar do .env estar correto. Causa: nomes de campo com múltiplos
+    underscores tornam ambígua, para o parser automático, a fronteira
+    entre prefixo do sub-model e nome do campo.
 
-    Esta função lê o .env diretamente (independente da resolução interna
-    do pydantic-settings) e aplica manualmente cada campo, usando
-    correspondência exata de "{prefix}{NOME_DO_CAMPO_EM_MAIUSCULO}" —
-    sem ambiguidade de underscore.
+    Esta função aplica manualmente cada campo, usando correspondência
+    exata de "{prefix}{NOME_DO_CAMPO_EM_MAIUSCULO}" — sem ambiguidade.
+
+    Args:
+        sub_model: Instância da sub-config a popular (ex: self.risk).
+        prefix: Prefixo das chaves (ex: "RISK_").
+        env_values: Dict de valores de ambiente já resolvidos (ver
+            _resolve_env_values_for_nested_overrides — pode vir de
+            arquivo .env, de os.environ, ou da mescla de ambos).
     """
     for field_name, field_info in sub_model.model_fields.items():
         env_key = f"{prefix}{field_name.upper()}"
@@ -235,6 +276,56 @@ def _apply_prefixed_env_overrides(
                 f"[CONFIG] Não foi possível converter {env_key}="
                 f"'{raw_value}' para o tipo esperado: {e}"
             )
+
+
+def _resolve_env_values_for_nested_overrides(
+    env_file: Optional[str],
+) -> Dict[str, Optional[str]]:
+    """
+    Resolve a fonte de valores usada para popular as sub-configs
+    aninhadas (risk, staking, notifications, dashboard, monitoring,
+    backtest), combinando o arquivo .env (se aplicável) com o ambiente
+    de processo (os.environ) — este último sempre com prioridade.
+
+    FIX (achado na análise dos resultados de teste — pytest local):
+    a versão anterior lia EXCLUSIVAMENTE dotenv_values(arquivo), nunca
+    considerando os.environ. Isso tinha dois efeitos práticos:
+
+    1. Variáveis de ambiente definidas diretamente no processo (ex:
+       via `docker run -e RISK_STOP_LOSS_PCT=...`, sem um arquivo .env
+       físico no container) eram silenciosamente ignoradas para as
+       sub-configs aninhadas — mesmo funcionando perfeitamente para os
+       campos de nível raiz (que o pydantic-settings resolve
+       nativamente via os.environ).
+    2. Testes que usam `monkeypatch.setenv(...)` para simular
+       variáveis de ambiente (sem escrever um arquivo .env físico)
+       nunca viam esse valor refletido nas sub-configs — o teste
+       sempre lia o arquivo .env real do disco, quando presente.
+
+    Args:
+        env_file: Caminho do arquivo .env a considerar, ou None/"" para
+            não ler nenhum arquivo (apenas os.environ é usado nesse
+            caso).
+
+    Returns:
+        Dict[str, Optional[str]]: valores mesclados, com os.environ
+            sobrepondo qualquer valor conflitante vindo do arquivo.
+    """
+    merged: Dict[str, Optional[str]] = {}
+
+    if env_file:
+        try:
+            file_values = dotenv_values(env_file)
+            if file_values:
+                merged.update(file_values)
+        except Exception as e:
+            log.debug(f"[CONFIG] Não foi possível ler '{env_file}': {e}")
+
+    # os.environ sempre tem prioridade — mesmo comportamento que
+    # pydantic-settings já aplica nativamente para campos de nível raiz.
+    merged.update(os.environ)
+
+    return merged
 
 
 class BotConfig(BaseSettings):
@@ -263,7 +354,7 @@ class BotConfig(BaseSettings):
     symbols: str = Field("BTC/USDC,ETH/USDC,SOL/USDC", description="Símbolos separados por vírgula")
 
     # ── Estratégia ──
-    strategy: StrategyType = Field(StrategyType.HYBRID_REGIME, description="Estratégia principal")
+    strategy: StrategyType = Field(StrategyType.HYBRID_REGIME, description="Estratégia principal (modo single-strategy)")
     timeframe: Timeframe = Field(Timeframe.H1, description="Timeframe padrão")
 
     # ── Estratégias habilitadas ──
@@ -299,20 +390,38 @@ class BotConfig(BaseSettings):
     # ── Dashboard ──
     dashboard_enabled: bool = Field(True, description="Habilita o dashboard web (thread em background dentro do processo live)")
 
+    # ── Ensemble de estratégias ──
+    ensemble_mode: bool = Field(
+        False,
+        description=(
+            "Se True, usa get_ensemble_signal() (combina todas as "
+            "estratégias em enabled_strategies, ponderadas por "
+            "confiança) em vez do modo single-strategy (cfg.strategy). "
+            "Default False para não alterar o comportamento de "
+            "instalações existentes."
+        ),
+    )
+    ensemble_min_confluence: int = Field(
+        2, ge=1, le=10,
+        description=(
+            "Número mínimo de estratégias habilitadas que precisam "
+            "concordar na mesma direção (buy ou sell) para o ensemble "
+            "emitir um sinal, em vez de hold."
+        ),
+    )
+    ensemble_min_avg_confidence: float = Field(
+        0.55, ge=0.0, le=1.0,
+        description=(
+            "Confiança média mínima (0.0-1.0) entre os votos de uma "
+            "direção para o ensemble emitir um sinal nessa direção."
+        ),
+    )
 
     # ── Sub-configs ──
     # FIX (auditoria — bug do pydantic-settings): default_factory=X faz o
     # sub-model ser instanciado ANTES da camada de resolução de env vars
-    # (env_nested_delimiter) ter chance de popular seus campos internos,
-    # em algumas versões de pydantic-settings. Resultado prático: valores
-    # como NOTIFICATIONS_TELEGRAM_BOT_TOKEN no .env nunca chegavam a
-    # cfg.notifications.telegram_bot_token — o campo ficava com o default
-    # vazio "", silenciosamente (sem erro, sem log). Isso explicava alertas
-    # de Telegram configurados mas nunca disparados.
-    #
-    # Correção: instanciar diretamente (RiskConfig() em vez de
-    # Field(default_factory=RiskConfig)) — validado no próprio
-    # experimento _test_config.py do repositório ("Solução 2").
+    # ter chance de popular seus campos internos, em algumas versões de
+    # pydantic-settings. Correção: instanciar diretamente.
     risk: RiskConfig = RiskConfig()
     staking: StakingConfig = StakingConfig()
     notifications: NotificationConfig = NotificationConfig()
@@ -355,7 +464,128 @@ class BotConfig(BaseSettings):
         "funding_arbitrage": {
             "1h": {"min_funding_rate": 0.0001, "max_funding_rate": 0.01, "position_hold_hours": 8, "atr_mult_sl": 1.0, "atr_mult_tp": 2.0, "max_positions": 3},
         },
+        "volatility_squeeze": {
+            "1h": {"squeeze_lookback": 50, "squeeze_quantile": 0.25, "volume_confirm_mult": 1.2, "atr_mult_sl": 1.5, "atr_mult_tp": 3.0},
+            "4h": {"squeeze_lookback": 50, "squeeze_quantile": 0.25, "volume_confirm_mult": 1.2, "atr_mult_sl": 1.8, "atr_mult_tp": 3.5},
+            "15m": {"squeeze_lookback": 50, "squeeze_quantile": 0.2, "volume_confirm_mult": 1.3, "atr_mult_sl": 1.2, "atr_mult_tp": 2.2},
+        },
+        "funding_weighted_trend": {
+            "1h": {"min_funding_rate": 0.0001, "max_funding_rate": 0.01, "rsi_exhaustion_high": 75, "rsi_exhaustion_low": 25, "atr_mult_sl": 2.0, "atr_mult_tp": 3.5},
+        },
     }
+
+    # ──────────────────────────────────────────────
+    # Construtor (FIX — achado na análise de teste)
+    # ──────────────────────────────────────────────
+
+    def __init__(self, **data: Any) -> None:
+        """
+        FIX (achado na análise dos resultados de pytest): pydantic-settings
+        resolve o parâmetro especial `_env_file` internamente para decidir
+        qual arquivo alimenta os campos de NÍVEL RAIZ (symbols, capital_usd
+        etc.) — essa parte já funcionava corretamente. Porém,
+        apply_nested_env_overrides() (o model_validator que popula
+        manualmente as sub-configs aninhadas) sempre lia
+        model_config["env_file"] (o default de CLASSE, ".env"),
+        ignorando completamente qualquer override de instância —
+        inclusive `_env_file=None`, usado por testes para isolar de um
+        .env real em disco.
+
+        Resultado prático observado: `BotConfig(_env_file=None)` em testes
+        ainda "vazava" valores de um .env real presente no diretório de
+        trabalho (token do Telegram, portas, percentuais de risco reais)
+        para dentro de cfg.risk/cfg.notifications/etc., mascarando os
+        valores esperados pelos testes (defaults ou monkeypatch.setenv).
+
+        Esta correção detecta quando `_env_file` foi passado
+        explicitamente (incluindo None) e, nesse caso, refaz a aplicação
+        das sub-configs aninhadas usando a fonte corretamente resolvida
+        (ver _resolve_env_values_for_nested_overrides), IGNORANDO
+        qualquer valor incorreto que o model_validator automático possa
+        ter aplicado durante a construção padrão.
+
+        Sub-configs passadas EXPLICITAMENTE como kwarg (ex:
+        `BotConfig(risk=RiskConfig(...))`) são preservadas intactas —
+        não são resetadas nem sobrescritas por este mecanismo.
+
+        Construções normais sem `_env_file` (o caso comum em produção,
+        `BotConfig()`) NÃO são afetadas por este método — apenas o
+        comportamento do model_validator automático muda ligeiramente
+        (ver apply_nested_env_overrides: agora também mescla os.environ,
+        não apenas o arquivo).
+
+        Args:
+            **data: Argumentos do construtor, incluindo eventualmente o
+                parâmetro especial `_env_file` do pydantic-settings.
+        """
+        env_file_explicit = "_env_file" in data
+        env_file_value = data.get("_env_file", ".env")
+        explicit_fields = set(data.keys())
+
+        super().__init__(**data)
+
+        if env_file_explicit:
+            self._reapply_nested_env_overrides(env_file_value, explicit_fields)
+
+    def _reapply_nested_env_overrides(
+        self, env_file: Optional[str], explicit_fields: Set[str]
+    ) -> None:
+        """
+        Corrige as sub-configs aninhadas para respeitar um `_env_file`
+        explicitamente passado ao construtor (ver __init__), incluindo o
+        caso `_env_file=None`.
+
+        Reseta cada sub-config (exceto as passadas explicitamente pelo
+        chamador, ver `explicit_fields`) para seus defaults declarados
+        antes de reaplicar — o model_validator automático já pode ter
+        populado valores incorretos (lidos do .env de classe) durante a
+        validação padrão que ocorre dentro de super().__init__().
+
+        Args:
+            env_file: Caminho do .env a considerar, ou None para não
+                carregar nenhum arquivo (usa apenas os.environ).
+            explicit_fields: Nomes dos campos passados diretamente ao
+                construtor (ex: {"risk", "strategy"}) — sub-configs
+                nesta lista são preservadas sem reset/reaplicação.
+        """
+        try:
+            nested_field_map = {
+                "risk": RiskConfig,
+                "staking": StakingConfig,
+                "notifications": NotificationConfig,
+                "dashboard": DashboardConfig,
+                "monitoring": MonitoringConfig,
+                "backtest": BacktestConfig,
+            }
+            prefix_map = {
+                "risk": "RISK_",
+                "staking": "STAKING_",
+                "notifications": "NOTIFICATIONS_",
+                "dashboard": "DASHBOARD_",
+                "monitoring": "MONITORING_",
+                "backtest": "BACKTEST_",
+            }
+
+            fields_to_process = [
+                name for name in nested_field_map if name not in explicit_fields
+            ]
+            if not fields_to_process:
+                return
+
+            for name in fields_to_process:
+                setattr(self, name, nested_field_map[name]())
+
+            env_values = _resolve_env_values_for_nested_overrides(env_file)
+            if not env_values:
+                return
+
+            for name in fields_to_process:
+                _apply_prefixed_env_overrides(
+                    getattr(self, name), prefix_map[name], env_values
+                )
+
+        except Exception as e:
+            log.error(f"[CONFIG] Erro ao reaplicar overrides de env aninhados: {e}")
 
     # ──────────────────────────────────────────────
     # Validators
@@ -405,14 +635,30 @@ class BotConfig(BaseSettings):
     def apply_nested_env_overrides(self) -> "BotConfig":
         """
         Sobrescreve manualmente as sub-configs aninhadas com os valores
-        reais do .env, contornando o bug de env_nested_delimiter (ver
-        _apply_prefixed_env_overrides). Roda DEPOIS que pydantic-settings
-        já tentou sua própria resolução automática — esta função corrige
-        qualquer campo que tenha ficado vazio incorretamente.
+        reais do .env de classe + os.environ, contornando o bug de
+        env_nested_delimiter (ver _apply_prefixed_env_overrides).
+
+        FIX (achado na análise de teste): passou a mesclar os.environ
+        com prioridade sobre o arquivo (antes lia SOMENTE o arquivo via
+        dotenv_values). Isso corrige dois cenários:
+        1. Produção: variáveis de ambiente definidas diretamente no
+           processo (ex: Docker sem .env físico) agora são respeitadas
+           para as sub-configs aninhadas, não só para os campos de
+           nível raiz.
+        2. Quando esta função roda durante a construção padrão de um
+           BotConfig(_env_file=None) (antes do __init__ customizado
+           corrigir o resultado via _reapply_nested_env_overrides),
+           pelo menos os valores vindos de os.environ (ex:
+           monkeypatch.setenv em testes) já ficam corretos nesta
+           primeira passada — o __init__ customizado então apenas
+           remove o vazamento remanescente do arquivo .env real.
+
+        Esta função roda DEPOIS que pydantic-settings já tentou sua
+        própria resolução automática.
         """
         try:
             env_file = self.model_config.get("env_file", ".env")
-            env_values = dotenv_values(env_file)
+            env_values = _resolve_env_values_for_nested_overrides(env_file)
 
             if not env_values:
                 return self
@@ -481,7 +727,6 @@ class BotConfig(BaseSettings):
         try:
             params = self.STRATEGY_DEFAULTS[strat].get(tf, {})
             if not params:
-                # Fallback para o primeiro timeframe disponível
                 first_tf = next(iter(self.STRATEGY_DEFAULTS[strat].values()))
                 params = first_tf
                 log.warning(f"Parâmetros não encontrados para {strat}/{tf}, usando fallback")
@@ -505,7 +750,6 @@ class BotConfig(BaseSettings):
     def to_dict(self) -> Dict[str, Any]:
         """Converte config para dict (omitindo credenciais)."""
         d = self.model_dump()
-        # Remove credenciais sensíveis
         d.pop("hyperliquid_private_key", None)
         return d
 
@@ -521,37 +765,13 @@ class BotConfig(BaseSettings):
 
     @classmethod
     def load_json(cls, path: str = "bot_config.json") -> "BotConfig":
-        """Carrega configuração de JSON e mescla com .env.
-
-        Suporta dois formatos de chave no JSON:
-        1. Campos de nível raiz (ex: "capital_usd", "leverage")
-        2. Sub-configs aninhadas como dict (ex: "risk": {"daily_loss_limit_pct": 5.0})
-
-        FIX (auditoria item 10): a versão anterior usava apenas
-        setattr(cfg, key, value) para cada chave do JSON, o que só
-        funciona para campos de nível raiz. Chaves com nomes que não
-        batem exatamente com um atributo de BotConfig (ex:
-        "max_daily_loss_pct" quando o campo real é
-        "risk.daily_loss_limit_pct") eram silenciosamente ignoradas
-        via hasattr() == False, sem log de aviso — o operador podia
-        editar o JSON acreditando que a configuração estava sendo
-        aplicada, quando na prática não estava.
-
-        Esta versão:
-        - Aplica corretamente sub-configs aninhadas quando fornecidas
-          como dict (risk, staking, notifications, dashboard,
-          monitoring, backtest).
-        - Loga um WARNING explícito para qualquer chave de nível raiz
-          que não corresponda a um campo real de BotConfig, em vez de
-          ignorar silenciosamente.
-        """
+        """Carrega configuração de JSON e mescla com .env."""
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
             cfg = cls()
 
-            # Nomes das sub-configs aninhadas conhecidas
             nested_configs = {
                 "risk", "staking", "notifications", "dashboard",
                 "monitoring", "backtest",
@@ -564,7 +784,6 @@ class BotConfig(BaseSettings):
                     continue
 
                 if key in nested_configs and isinstance(value, dict):
-                    # Aplica campo a campo dentro da sub-config
                     sub_cfg = getattr(cfg, key)
                     for sub_key, sub_value in value.items():
                         if hasattr(sub_cfg, sub_key):
@@ -592,7 +811,7 @@ class BotConfig(BaseSettings):
         except FileNotFoundError:
             log.warning(f"Arquivo {path} não encontrado, usando defaults")
             return cls()
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:   # ALTERADO: + UnicodeDecodeError
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
             log.error(f"Erro ao carregar {path}: {e}")
             return cls()
 
@@ -605,11 +824,9 @@ class BotConfig(BaseSettings):
         """
         errors: List[str] = []
 
-        # Valida capital mínimo
         if self.capital_usd < 10:
             errors.append("Capital mínimo é $10 USD")
 
-        # Valida exposição total
         total_exposure = self.max_position_pct * len(self.parse_symbols())
         if total_exposure > self.risk.max_exposure_pct:
             errors.append(
@@ -617,15 +834,12 @@ class BotConfig(BaseSettings):
                 f"({self.risk.max_exposure_pct}%). Reduza max_position_pct ou símbolos."
             )
 
-        # Valida TP > SL
         if self.risk.take_profit_pct <= self.risk.stop_loss_pct:
             errors.append("Take Profit deve ser maior que Stop Loss")
 
-        # Valida trailing stop
         if self.risk.trailing_stop_activation_pct <= self.risk.trailing_stop_distance_pct:
             errors.append("Ativação do trailing stop deve ser maior que a distância")
 
-        # Valida staking
         if self.staking.enabled:
             if self.staking.stake_pct > 0 and not self.staking.validator_address:
                 errors.append("Staking ativado mas validator_address não definido")

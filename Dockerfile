@@ -54,9 +54,18 @@ USER botuser
 # Portas
 EXPOSE 8080 9090 8081
 
-# Health check (verifica processo, já que o HTTP server só sobe em modo dashboard)
+# FIX (auditoria — item 8): antes o HEALTHCHECK só confirmava que o
+# PROCESSO existia (pgrep), não que o bot estava operacional (conectado
+# à exchange, sem erros consecutivos, ciclo rodando). O próprio
+# health_server.py já expõe /health com status estruturado
+# ("online"/"degraded"/"error" — ver crypto_bot_core/health_server.py e
+# HyperliquidBot.step()/update_health()). Agora o HEALTHCHECK consome
+# esse endpoint real via curl, retornando código de saída != 0 (e
+# portanto Docker marcando o container como "unhealthy") sempre que
+# /health não responder 200 — o que só ocorre quando
+# _health_state["status"] == "online".
 HEALTHCHECK --interval=60s --timeout=10s --start-period=60s --retries=3 \
-    CMD pgrep -f "python main.py" || exit 1
+    CMD curl -f http://localhost:8081/health || exit 1
 
 # Comando padrão
 CMD ["python", "main.py"]

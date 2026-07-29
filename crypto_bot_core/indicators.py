@@ -425,28 +425,46 @@ def add_volume_profile(
 def add_cvd(df: pd.DataFrame, col_name: str = "cvd") -> pd.DataFrame:
     """
     Adiciona CVD (Cumulative Volume Delta) ao DataFrame.
-    Delta = volume_up - volume_down (aproximado por close direction).
+
+    FIX (melhoria de qualidade — análise de orderflow_delta): a proxy
+    anterior usava apenas sign(close - close.shift()) — um candle de
+    alta com pavio superior grande (pressão vendedora real no
+    fechamento) era contado como 100% comprador, mesmo que o
+    fechamento tenha ficado perto da mínima da barra. Substituído por
+    Close Location Value (CLV), técnica padrão (usada em Chaikin Money
+    Flow/Accumulation-Distribution) que pondera pela POSIÇÃO do
+    fechamento dentro do range [low, high] da barra, não apenas a
+    direção close-a-close:
+
+        clv = ((close - low) - (high - close)) / (high - low)
+        delta = volume * clv
+
+    clv varia de -1 (fechou na mínima, pressão totalmente vendedora)
+    a +1 (fechou na máxima, pressão totalmente compradora) — captura
+    a intenção real da barra melhor que um sinal binário.
+
+    Requer 'high'/'low' além de 'volume'/'close' (diferente da versão
+    anterior) — barras com high==low (sem range, ex: dados
+    corrompidos/gaps) recebem delta=0 por segurança.
 
     Args:
-        df: DataFrame com colunas 'volume', 'close'.
+        df: DataFrame com colunas 'high', 'low', 'volume', 'close'.
         col_name: Nome da coluna.
 
     Returns:
         DataFrame com CVD.
     """
     try:
-        if not _validate_dataframe(df, ["volume", "close"]):
+        if not _validate_dataframe(df, ["high", "low", "volume", "close"]):
             return df
 
-        # Delta aproximado: se close > open, volume é buy; se close < open, volume é sell
-        price_direction = np.sign(df["close"] - df["close"].shift(1))
-        df["delta"] = df["volume"] * price_direction
-        df["delta"] = df["delta"].fillna(0)
+        high_low_range = (df["high"] - df["low"]).replace(0, np.nan)
+        clv = ((df["close"] - df["low"]) - (df["high"] - df["close"])) / high_low_range
+        clv = clv.fillna(0.0).clip(-1.0, 1.0)
 
-        # CVD cumulativo
+        df["delta"] = (df["volume"] * clv).fillna(0.0)
+
         df[col_name] = df["delta"].cumsum()
-
-        # CVD médio (suavizado)
         df[f"{col_name}_ma"] = df[col_name].rolling(window=20).mean()
 
         return df
@@ -459,14 +477,38 @@ def add_orderflow(
     df: pd.DataFrame,
     lookback: int = 10,
     col_prefix: str = "of",
+    absorption_volume_percentile: float = 0.8,
+    absorption_range_percentile: float = 0.2,
 ) -> pd.DataFrame:
     """
     Adiciona indicadores de OrderFlow.
+
+    FIX (melhoria de qualidade — análise de orderflow_delta): os
+    percentis de volume/range para detecção de absorção agora são
+    PARÂMETROS explícitos (antes hardcoded como 0.8/0.2 direto no
+    corpo da função), permitindo que get_strategy_params() de fato
+    influencie o cálculo — antes, absorption_threshold em
+    STRATEGY_DEFAULTS['orderflow_delta'] era lido pela estratégia mas
+    nunca chegava até aqui, era um parâmetro morto.
+
+    NOTA: absorption_threshold em STRATEGY_DEFAULTS continua sendo
+    usado como fator de CONFIRMAÇÃO na estratégia (ver
+    signal_orderflow_delta), não como percentil de detecção — os
+    parâmetros aqui (absorption_volume_percentile/
+    absorption_range_percentile) controlam a SENSIBILIDADE da
+    detecção de absorção nos indicadores; absorption_threshold
+    controla o quão forte o sinal precisa ser para a estratégia agir
+    sobre uma absorção já detectada. São complementares, não
+    duplicados.
 
     Args:
         df: DataFrame com colunas 'high', 'low', 'close', 'volume'.
         lookback: Período de lookback para divergências.
         col_prefix: Prefixo das colunas.
+        absorption_volume_percentile: Percentil mínimo de volume
+            (rank) para considerar absorção candidata.
+        absorption_range_percentile: Percentil máximo de range da
+            barra (quantile) para considerar absorção candidata.
 
     Returns:
         DataFrame com OrderFlow.
@@ -475,27 +517,22 @@ def add_orderflow(
         if not _validate_dataframe(df, ["high", "low", "close", "volume"]):
             return df
 
-        # Certifica que CVD existe
         if "cvd" not in df.columns:
             df = add_cvd(df)
 
-        # Divergência: preço sobe mas CVD cai (bearish divergence)
         price_high = df["close"].rolling(window=lookback).max()
         price_low = df["close"].rolling(window=lookback).min()
         cvd_high = df["cvd"].rolling(window=lookback).max()
         cvd_low = df["cvd"].rolling(window=lookback).min()
 
-        # Bearish divergence: price making higher high, CVD making lower high
         df[f"{col_prefix}_bearish_div"] = ((df["close"] >= price_high) & (df["cvd"] <= cvd_high)).astype(int)
-
-        # Bullish divergence: price making lower low, CVD making higher low
         df[f"{col_prefix}_bullish_div"] = ((df["close"] <= price_low) & (df["cvd"] >= cvd_low)).astype(int)
 
-        # Absorption: volume muito alto com movimento de preço pequeno
         df[f"{col_prefix}_range"] = (df["high"] - df["low"]) / df["close"].replace(0, np.nan)
         df[f"{col_prefix}_volume_rank"] = df["volume"].rank(pct=True)
         df[f"{col_prefix}_absorption"] = (
-            (df[f"{col_prefix}_volume_rank"] > 0.8) & (df[f"{col_prefix}_range"] < df[f"{col_prefix}_range"].quantile(0.2))
+            (df[f"{col_prefix}_volume_rank"] > absorption_volume_percentile)
+            & (df[f"{col_prefix}_range"] < df[f"{col_prefix}_range"].quantile(absorption_range_percentile))
         ).astype(int)
 
         return df

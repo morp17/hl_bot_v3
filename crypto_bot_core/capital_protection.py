@@ -1,12 +1,14 @@
 """
 Módulo de Proteção de Capital — Hyperliquid Production Bot v3.0
 ================================================================
-Implementa sistema de proteção de capital em 4 níveis:
+Implementa sistema de proteção de capital em níveis:
 
-Nível 1 — Filtros de Mercado: spread, funding rate, horário, BTC crash
-Nível 2 — Drawdown: limite de perda diária, drawdown máximo
-Nível 3 — Exposição: limite por ativo, correlação entre posições
-Nível 4 — Emergência: circuit breakers, pause automático
+Nível 1  — Filtros de Mercado: spread, funding rate, horário, BTC crash
+Nível 2  — Drawdown: limite de perda diária, drawdown máximo
+Nível 3  — Exposição: limite por ativo / posição individual
+Nível 3b — Exposição correlacionada: limite direcional agregado entre
+           ativos correlacionados (ex: BTC/ETH/SOL) — NOVO
+Nível 4  — Emergência: circuit breakers, pause automático
 
 Requisitos:
 - Type hints
@@ -52,11 +54,12 @@ class ProtectionState:
 
 class CapitalProtection:
     """
-    Sistema de proteção de capital em 4 níveis.
+    Sistema de proteção de capital em múltiplos níveis.
 
     Nível 1: Filtros de mercado (spread, funding, horário)
     Nível 2: Drawdown e perda diária
-    Nível 3: Exposição por ativo e correlação
+    Nível 3: Exposição por posição individual e total bruta
+    Nível 3b: Exposição correlacionada agregada (NOVO — auditoria item 5)
     Nível 4: Circuit breakers e pause automático
     """
 
@@ -75,6 +78,7 @@ class CapitalProtection:
         trade_hour_end_utc: int = 0,
         max_spread_pct: float = 0.005,
         max_funding_rate: float = 0.001,
+        max_correlated_exposure_pct: float = 0.60,   # NOVO (item 5)
         # REMOVIDO: btc_crash_filter_pct (nunca teve verificação implementada)
     ) -> None:
         """
@@ -86,7 +90,8 @@ class CapitalProtection:
             max_drawdown_pct: Drawdown máximo permitido (%).
             max_consecutive_losses: Máximo de perdas consecutivas.
             cooldown_after_loss_sec: Cooldown após perda (segundos).
-            max_exposure_pct: Exposição máxima total (%).
+            max_exposure_pct: Exposição bruta máxima total (%) — soma
+                simples de todas as posições, sem considerar correlação.
             max_position_pct: Exposição máxima por posição (%).
             circuit_breaker_loss_pct: Perda que aciona circuit breaker (%).
             circuit_breaker_cooldown_sec: Cooldown do circuit breaker (segundos).
@@ -94,6 +99,14 @@ class CapitalProtection:
             trade_hour_end_utc: Hora UTC de fim.
             max_spread_pct: Spread máximo permitido.
             max_funding_rate: Funding rate máximo permitido.
+            max_correlated_exposure_pct: Exposição direcional máxima
+                agregada (%) — FIX CRÍTICO (auditoria item 5): trata
+                por padrão todos os símbolos operados como pertencentes
+                ao mesmo grupo de correlação (majors cripto tendem a
+                mover-se juntos), evitando que N posições
+                individualmente dentro do limite representem, juntas,
+                uma única aposta direcional muito maior do que
+                risk_per_trade sugere isoladamente.
         """
         self.max_daily_loss_pct = max_daily_loss_pct
         self.max_drawdown_pct = max_drawdown_pct
@@ -107,6 +120,7 @@ class CapitalProtection:
         self.trade_hour_end_utc = trade_hour_end_utc
         self.max_spread_pct = max_spread_pct
         self.max_funding_rate = max_funding_rate
+        self.max_correlated_exposure_pct = max_correlated_exposure_pct   # NOVO
         # REMOVIDO: self.btc_crash_filter_pct = btc_crash_filter_pct
 
         self.state = ProtectionState(
@@ -315,10 +329,18 @@ class CapitalProtection:
         new_position_value: float = 0.0,
     ) -> Tuple[bool, str]:
         """
-        Verifica se a exposição total está dentro do limite.
+        Verifica se a exposição total (bruta, sem considerar correlação
+        entre ativos) está dentro do limite.
+
+        NOTA: este método já existia mas não era chamado em nenhum
+        lugar de main.py até a correção da auditoria (item 5) — agora
+        é invocado em _process_symbol() antes de cada entrada, junto
+        com check_correlated_exposure() abaixo.
 
         Args:
-            current_positions_value: Valor total das posições atuais.
+            current_positions_value: Valor total das posições atuais
+                (soma de qty*entry_price de TODAS as posições abertas,
+                não apenas do símbolo sendo processado).
             new_position_value: Valor da nova posição proposta.
 
         Returns:
@@ -348,6 +370,64 @@ class CapitalProtection:
 
         except Exception as e:
             log.error(f"[N3] Erro em check_exposure: {e}")
+            return True, "ok"
+
+    def check_correlated_exposure(
+        self,
+        total_notional_all_positions: float,
+        new_position_notional: float = 0.0,
+    ) -> Tuple[bool, str]:
+        """
+        Nível 3b — Verifica exposição direcional agregada entre ativos
+        correlacionados.
+
+        FIX CRÍTICO (auditoria — item 5): até esta correção, cada
+        símbolo (BTC/ETH/SOL) tinha seu próprio limite individual de
+        exposição (max_position_pct), mas nada impedia que o bot abrisse
+        posições LONG simultâneas em BTC + ETH + SOL — ativos altamente
+        correlacionados — cada uma dentro do limite individual, mas
+        juntas representando uma única aposta direcional muito maior do
+        que risk_per_trade_pct sugere isoladamente.
+
+        Este método trata, de forma conservadora, TODOS os símbolos
+        operados pelo bot como pertencentes ao mesmo grupo de
+        correlação (majors cripto tendem a se mover em conjunto,
+        especialmente em movimentos de risk-off). Não distingue
+        direção (long vs. short) por simplicidade — uma extensão
+        futura poderia calcular exposição líquida (long - short) em
+        vez de bruta, mas a versão bruta é o lado conservador (mais
+        restritivo) e por isso foi escolhida aqui.
+
+        Para desabilitar esta proteção (ex: se as posições do bot são
+        deliberadamente hedgeadas entre si), configure
+        RISK_MAX_CORRELATED_EXPOSURE_PCT=100.
+
+        Args:
+            total_notional_all_positions: Soma de qty*entry_price de
+                TODAS as posições abertas em TODOS os símbolos.
+            new_position_notional: Valor da nova posição proposta.
+
+        Returns:
+            Tuple[bool, str]: (ok, motivo).
+        """
+        try:
+            balance = max(self.state.current_balance, 1)
+            total = total_notional_all_positions + new_position_notional
+            pct = total / balance
+
+            if pct > self.max_correlated_exposure_pct:
+                log.warning(
+                    f"[N3b] Exposição correlacionada agregada {pct:.1%} > "
+                    f"{self.max_correlated_exposure_pct:.1%} — bloqueando "
+                    f"nova entrada (ativos majors tratados como grupo único "
+                    f"de correlação)"
+                )
+                return False, f"exposicao_correlacionada_{pct:.1%}"
+
+            return True, "ok"
+
+        except Exception as e:
+            log.error(f"[N3b] Erro em check_correlated_exposure: {e}")
             return True, "ok"
 
     # ── Nível 4: Circuit Breaker ─────────────
@@ -442,7 +522,12 @@ class CapitalProtection:
         funding_rate: Optional[float] = None,
     ) -> Tuple[bool, List[str]]:
         """
-        Executa todas as verificações de proteção.
+        Executa todas as verificações de proteção de mercado/risco
+        básicas (Níveis 1, 2 e 4). Exposição (Nível 3) e exposição
+        correlacionada (Nível 3b) são checadas separadamente em
+        main.py::_process_symbol(), pois dependem do notional da nova
+        posição calculado após o sizing — não fazem parte deste
+        check_all() genérico por design.
 
         Args:
             spread_pct: Spread atual (%). Se None, o check é pulado
@@ -494,6 +579,7 @@ class CapitalProtection:
                 "max_drawdown_pct": self.max_drawdown_pct,
                 "max_consecutive_losses": self.max_consecutive_losses,
                 "max_exposure_pct": self.max_exposure_pct,
+                "max_correlated_exposure_pct": self.max_correlated_exposure_pct,
                 "circuit_breaker_loss_pct": self.circuit_breaker_loss_pct,
             },
         }

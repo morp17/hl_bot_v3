@@ -29,7 +29,13 @@ services:
       - hl-network
     command: python main.py
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'python main.py' || exit 1"]
+      # FIX (auditoria — item 8): usa o endpoint HTTP estruturado
+      # /health (health_server.py, porta 8081) em vez de apenas
+      # verificar se o processo existe via pgrep. Isso detecta de
+      # fato quando o bot está travado/degradado mesmo com o processo
+      # Python ainda rodando (ex: loop principal preso, erro contínuo
+      # de sincronização com a exchange refletido em update_health()).
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
       interval: 60s
       timeout: 10s
       retries: 3

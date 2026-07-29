@@ -1,494 +1,409 @@
-# Hyperliquid Production Bot v3.0
+# 🤖 Hyperliquid Production Bot v3.0
 
-Bot de trading automatizado para **Hyperliquid DEX** com 7 estratégias, proteção de capital em 4 níveis, staking HYPE, dashboard local e deploy Docker.
+> Bot de trading algorítmico para a **Hyperliquid DEX** (perpétuos), com arquitetura modular, 9 estratégias, ensemble ponderado e sistema de risco em 4 níveis.
+
+---
 
 ## 📋 Índice
 
-- [Requisitos](#-requisitos)
-- [Instalação](#-instalação)
-- [Configuração](#-configuração)
-- [Uso](#-uso)
-- [Estratégias](#-estratégias)
-- [Proteção de Capital](#-proteção-de-capital)
-- [Staking](#-staking)
-- [Notificações](#-notificações)
-- [Dashboard](#-dashboard)
-- [Docker](#-docker)
-- [Testes](#-testes)
-- [Estrutura do Projeto](#-estrutura-do-projeto)
+1. [Visão Geral](#-visão-geral)
+2. [Instalação e Configuração](#-instalação-e-configuração)
+3. [Modos de Operação](#-modos-de-operação)
+4. [Configuração — `.env` (Referência Completa)](#-configuração--env-referência-completa)
+5. [Arquitetura do Núcleo](#-arquitetura-do-núcleo-de-negociação)
+6. [Sistema de Risco](#-sistema-de-risco)
+7. [Modo Ensemble](#-modo-ensemble)
+8. [Catálogo de Estratégias](#-estratégias--catálogo-completo)
+9. [Backtest](#-backtest--uso-correto)
+10. [CI/CD e Qualidade](#-cicd-e-qualidade-de-código)
+11. [Limitações Conhecidas](#-limitações-conhecidas)
+12. [Roadmap e Próximos Passos](#-roadmap-e-próximos-passos)
 
 ---
 
-## 🔧 Requisitos
+## 🎯 Visão Geral
 
-- **Python 3.12+**
-- **Pip** (gerenciador de pacotes)
-- **Conta na Hyperliquid** (testnet ou mainnet)
-- **Carteira Ethereum** com private key
-
-### Dependências
-
-Todas as dependências estão listadas em [`requirements.txt`](hl_bot_v3/requirements.txt):
-
-```
-pydantic>=2.0
-pydantic-settings>=2.0
-ccxt>=4.0
-hyperliquid-python-sdk>=0.0.1
-pandas>=2.0
-numpy>=1.24
-loguru>=0.7
-requests>=2.31
-eth-account>=0.5
-python-dotenv>=1.0
-pytest>=8.0
-```
+| Recurso | Descrição |
+|---------|-----------|
+| **Estratégias** | 9 estratégias (7 originais + 2 novas) com modo single ou ensemble ponderado |
+| **Risco** | 4 níveis de proteção + validação pré-trade de liquidação |
+| **Sincronização** | Reconciliação cruzada periódica com a exchange |
+| **Dashboard** | Web autenticado, health check real, trilha de auditoria persistente (JSONL) |
+| **Backtest** | Bypass configurável de `enabled_strategies`, suporte a ensemble |
 
 ---
 
-## 🚀 Instalação
-
-### 1. Clone o repositório
+## 🚀 Instalação e Configuração
 
 ```bash
-cd e:/BOTS/VPS/C_BOT/hl_bot_v3
-```
-
-### 2. Crie um ambiente virtual (recomendado)
-
-```bash
+# 1. Criar ambiente virtual
 python -m venv venv
-# Windows:
-venv\Scripts\activate
-# Linux/Mac:
-source venv/bin/activate
-```
+venv\Scripts\Activate.ps1        # Windows
+source venv/bin/activate           # Linux/Mac
 
-### 3. Instale as dependências
-
-```bash
+# 2. Instalar dependências
 pip install -r requirements.txt
-```
 
-### 4. Configure o arquivo `.env`
-
-Copie o arquivo de exemplo e preencha com suas credenciais:
-
-```bash
+# 3. Configurar variáveis de ambiente
 cp .env.example .env
+# → Edite .env com suas credenciais (NUNCA commite o .env real!)
 ```
 
-Edite o arquivo `.env` com suas informações:
-
-```ini
-# Credenciais da Hyperliquid (testnet)
-HYPERLIQUID_PRIVATE_KEY=0x_sua_private_key_aqui
-HYPERLIQUID_ACCOUNT_ADDRESS=0x_seu_endereco_aqui
-TESTNET=true
-
-# Símbolos para trading
-SYMBOLS=BTC/USDC,ETH/USDC,SOL/USDC
-
-# Estratégia
-STRATEGY=hybrid_regime
-TIMEFRAME=1h
-
-# Capital
-CAPITAL_USD=1000
-RISK_PER_TRADE_PCT=1.0
-```
-
-### 5. Verifique a instalação
+### ✅ Testes
 
 ```bash
-python -m pytest tests/ -v
-```
+# Suíte completa (Windows: test_lock.py roda separado)
+python -m pytest tests/ -v --ignore=tests/test_lock.py
 
-Todos os **271 testes** devem passar.
+# Teste de locks isolado
+python -m pytest tests/test_lock.py -v
+```
 
 ---
 
-## ⚙️ Configuração
-
-### Variáveis de Ambiente (`.env`)
-
-O arquivo `.env` usa **prefixos** para organizar sub-modelos do Pydantic:
-
-| Prefixo | Sub-modelo | Exemplo |
-|---------|-----------|---------|
-| *(raiz)* | `BotConfig` | `CAPITAL_USD=1000` |
-| `RISK_` | `RiskConfig` | `RISK_STOP_LOSS_PCT=2.0` |
-| `NOTIFICATIONS_` | `NotificationConfig` | `NOTIFICATIONS_TELEGRAM_BOT_TOKEN=...` |
-| `STAKING_` | `StakingConfig` | `STAKING_ENABLED=false` |
-| `DASHBOARD_` | `DashboardConfig` | `DASHBOARD_PORT=8080` |
-| `MONITORING_` | `MonitoringConfig` | `MONITORING_PROMETHEUS_PORT=9090` |
-| `BACKTEST_` | `BacktestConfig` | `BACKTEST_START_DATE=2024-01-01` |
-
-### Parâmetros de Risco
-
-| Variável | Default | Descrição |
-|----------|---------|-----------|
-| `RISK_MAX_OPEN_TRADES` | 3 | Máximo de trades simultâneos |
-| `RISK_MAX_DRAWDOWN_PCT` | 15.0 | Drawdown máximo (%) |
-| `RISK_DAILY_LOSS_LIMIT_PCT` | 5.0 | Limite de perda diária (%) |
-| `RISK_MAX_CONSECUTIVE_LOSSES` | 3 | Perdas consecutivas máximas |
-| `RISK_COOLDOWN_AFTER_LOSS_SEC` | 300 | Cooldown após perda (s) |
-| `RISK_STOP_LOSS_PCT` | 2.0 | Stop Loss padrão (%) |
-| `RISK_TAKE_PROFIT_PCT` | 5.0 | Take Profit padrão (%) |
-| `RISK_TRAILING_STOP` | false | Habilitar trailing stop |
-| `RISK_CIRCUIT_BREAKER_LOSS_PCT` | 15.0 | Perda que aciona circuit breaker (%) |
-
----
-
-## 🎮 Uso
-
-### Modo Live (Trading Real)
+## ⚙️ Modos de Operação
 
 ```bash
-cd hl_bot_v3
-python main.py --mode live --interval 60
-```
+# 🟢 Trading real
+python main.py --mode live
 
-- `--interval`: Intervalo entre ciclos em segundos (default: 60)
-- O bot executa um loop infinito até `Ctrl+C`
-
-### Modo Backtest
-
-```bash
+# 📊 Backtest single-strategy
 python main.py --mode backtest --symbol BTC/USDC
-```
 
-Executa o `BacktestEngine` sobre dados históricos reais buscados da
-exchange. Para validação de robustez temporal (múltiplas janelas
-sequenciais, sem reotimização de parâmetros entre elas), use
-`BacktestEngine.run_walk_forward()` programaticamente — ainda não
-exposto via CLI.
+# 📊 Backtest modo ensemble
+python main.py --mode backtest --symbol ETH/USDC --ensemble
 
-> ⚠️ **Leia antes de confiar nos resultados**: o motor aplica
-> slippage configurável e checa SL/TP contra o range high/low de
-> cada barra (não apenas o close), mas quando ambos SL e TP são
-> tocados na mesma barra, o SL é assumido como o primeiro a ser
-> atingido — uma premissa conservadora, não um fato garantido sem
-> dados intrabar (tick/M1). Trate os resultados como estimativa,
-> não como garantia de performance futura.
+# 🔒 Simula fielmente o comportamento de produção
+python main.py --mode backtest --symbol BTC/USDC --respect-enabled-strategies
 
-### Modo Dashboard
-
-```bash
+# 🖥️ Dashboard standalone (debug apenas)
 python main.py --mode dashboard
 ```
 
-Inicia o servidor web local para monitoramento (porta 8080 por padrão).
-
-### Parâmetros da CLI
-
-| Parâmetro | Default | Descrição |
-|-----------|---------|-----------|
-| `--mode` | `live` | Modo: `live`, `backtest`, `dashboard` |
-| `--symbol` | `""` | Símbolo para backtest |
-| `--interval` | `60` | Intervalo entre ciclos (s) |
-| `--config` | `.env` | Caminho do arquivo de configuração |
+> ⚠️ **Atenção:** Em modo `live`, o dashboard já sobe automaticamente como thread em background. **Não use** `--mode dashboard` para monitorar um bot ao vivo real.
 
 ---
 
-## 📈 Estratégias
+## 🔐 Configuração — `.env` (Referência Completa)
 
-O bot implementa **7 estratégias** de trading, selecionáveis via `STRATEGY` no `.env`.
+### Credenciais e Modo
 
-> ⚠️ **Nem todas estão liberadas para operar por padrão.** O controle
-> `ENABLED_STRATEGIES` (ver `.env.example`) restringe quais estratégias
-> podem gerar sinais reais. Por padrão, apenas `trend_follow`,
-> `adaptive_trend` e `hybrid_regime` estão habilitadas — as demais
-> (`mean_reversion`, `orderflow_delta`, `scalping_grid`,
-> `funding_arbitrage`) mostraram expectância negativa ou insuficiente
-> nos backtests de referência do repositório, ou dependem de dados
-> (funding rate) que exigem configuração adicional. Alterar
-> `STRATEGY=mean_reversion` sem também adicionar `mean_reversion` a
-> `ENABLED_STRATEGIES` resulta no bot retornando `hold` permanentemente.
+```env
+HYPERLIQUID_PRIVATE_KEY=
+HYPERLIQUID_ACCOUNT_ADDRESS=
+TESTNET=true
+```
 
-### 1. Trend Follow (`trend_follow`)
-Segue tendência usando EMAs (9/21/200) + RSI + ADX.
-- **Entrada long:** EMA fast > EMA slow, preço > EMA 200, RSI < 70, ADX > 25
-- **Entrada short:** EMA fast < EMA slow, preço < EMA 200, RSI > 30, ADX > 25
+> 💡 **Sempre valide em testnet antes de mainnet.** `TESTNET=false` sem credenciais gera apenas warning no boot — não bloqueia. Confirme manualmente antes de rodar `--mode live` em produção.
 
-### 2. Mean Reversion (`mean_reversion`)
-Reversão à média com Bollinger Bands + RSI.
-- **Entrada long:** Preço ≤ banda inferior, RSI < 30
-- **Entrada short:** Preço ≥ banda superior, RSI > 70
+### Símbolos e Estratégia
 
-### 3. Adaptive Trend (`adaptive_trend`)
-Alterna entre trend following e range trading baseado no ADX.
-- **ADX > 25:** Modo tendência (segue EMAs)
-- **ADX < 20:** Modo range (RSI extremos)
-- **ADX 20-25:** Modo híbrido (cruzamento de EMAs)
+```env
+SYMBOLS=BTC/USDC,ETH/USDC,SOL/USDC
+STRATEGY=hybrid_regime
+ENABLED_STRATEGIES=trend_follow,adaptive_trend,hybrid_regime
+TIMEFRAME=1h
+```
 
-### 4. Hybrid Regime (`hybrid_regime`) — **Recomendada**
-3 camadas de análise:
-- **Layer 1:** Regime macro (EMAs 50/200 → bull/bear/sideways)
-- **Layer 2:** VWAP sweep (preço varrendo VWAP com desvio padrão)
-- **Layer 3:** SMC Structure (Break of Structure / Change of Character)
+> 🛡️ `ENABLED_STRATEGIES` é o **gate de segurança** contra operar estratégias não validadas. Em modo ensemble, essa lista vira os participantes do ensemble, não apenas um filtro.
 
-### 5. OrderFlow Delta (`orderflow_delta`)
-Baseada em delta, CVD e divergências.
-- **Entrada long:** Delta positivo, CVD > média, divergência bullish
-- **Entrada short:** Delta negativo, CVD < média, divergência bearish
+### Ensemble
 
-### 6. Scalping Grid (`scalping_grid`)
-Grid trading para timeframes curtos (1m/5m).
-- Cria níveis de compra/venda ao redor do preço
-- Compra em suportes com RSI baixo, vende em resistências com RSI alto
+```env
+ENSEMBLE_MODE=false
+ENSEMBLE_MIN_CONFLUENCE=2
+ENSEMBLE_MIN_AVG_CONFIDENCE=0.55
+```
 
-### 7. Funding Arbitrage (`funding_arbitrage`)
-Arbitragem de funding rate.
-- **Funding muito positivo (+1%):** Vender (mercado comprado)
-- **Funding muito negativo (-1%):** Comprar (mercado vendido)
+> 📖 Ver [seção 7](#-modo-ensemble) para detalhes.
+
+### Capital e Risco (Nível Raiz)
+
+```env
+CAPITAL_USD=1000
+RISK_PER_TRADE_PCT=1.0
+MAX_POSITION_PCT=20.0
+LEVERAGE=3
+ISOLATED_MARGIN=true
+```
+
+### Bloco `RISK_*`
+
+```env
+RISK_MAX_OPEN_TRADES=3
+RISK_MAX_DRAWDOWN_PCT=15.0
+RISK_DAILY_LOSS_LIMIT_PCT=5.0
+RISK_MAX_CONSECUTIVE_LOSSES=3
+RISK_COOLDOWN_AFTER_LOSS_SEC=300
+RISK_STOP_LOSS_PCT=2.0
+RISK_TAKE_PROFIT_PCT=5.0
+RISK_TRAILING_STOP=false
+RISK_TRAILING_STOP_ACTIVATION_PCT=3.0
+RISK_TRAILING_STOP_DISTANCE_PCT=0.5
+RISK_MAX_EXPOSURE_PCT=80.0
+RISK_MAX_CORRELATED_EXPOSURE_PCT=60.0
+RISK_TAKER_FEE=0.0005
+RISK_CIRCUIT_BREAKER_LOSS_PCT=15.0
+RISK_CIRCUIT_BREAKER_COOLDOWN_SEC=3600
+RISK_MAX_SPREAD_PCT=0.5
+RISK_MAX_FUNDING_RATE=0.1
+```
+
+> ⚠️ `RISK_MAX_FUNDING_RATE` está em **pontos percentuais** (`0.1 = 0.1%`), convertido internamente via `RiskConfig.max_funding_rate_fraction`. Não confundir com o parâmetro de mesmo nome em `STRATEGY_DEFAULTS['funding_arbitrage']`, que é **fração direta** (`0.01 = 1%`) — propósitos e escalas diferentes por design.
+
+### Dashboard
+
+```env
+DASHBOARD_HOST=0.0.0.0
+DASHBOARD_PORT=8080
+DASHBOARD_USER=admin
+DASHBOARD_PASSWORD=changeme
+```
+
+> 🔒 **Troque a senha padrão** antes de expor a porta além de localhost. Todas as rotas exigem HTTP Basic Auth. O `POST /api/config` permite alterar SL/TP/drawdown/estratégias habilitadas em produção.
+
+### Outros Blocos
+
+Os demais blocos — `NOTIFICATIONS_*`, `STAKING_*`, `MONITORING_*`, `BACKTEST_*` — seguem o padrão documentado inline no arquivo `.env.example`.
 
 ---
 
-## 🛡️ Proteção de Capital
+## 🏗️ Arquitetura do Núcleo de Negociação
 
-Sistema em **4 níveis**:
+```
+Config → Estratégia(s) → Sinal (+ confidence) → Proteções (N1-N4) → Sizing → 
+Validação de liquidação → Execução → Monitor/Ledger/Dashboard
+```
 
-### Nível 1 — Filtros de Mercado
-- **Horário:** Opera apenas na janela configurada (`trade_hour_start_utc`/`end_utc`)
-- **Spread:** Bloqueia se spread > `max_spread_pct`
-- **Funding:** Bloqueia se funding rate > `max_funding_rate`
+### Ciclo `step()` (a cada `--interval` segundos)
 
-### Nível 2 — Drawdown e Perda
-- **Drawdown máximo:** Pausa se drawdown > `max_drawdown_pct`
-- **Perda diária:** Pausa se perda do dia > `daily_loss_limit_pct`
-- **Perdas consecutivas:** Pausa após N perdas seguidas
-- **Cooldown:** Aguarda X segundos após perda
-
-### Nível 3 — Exposição
-- **Exposição total:** Limita % do capital em posições
-- **Posição individual:** Limita % do capital por trade
-
-### Nível 4 — Circuit Breaker
-- Aciona automaticamente se a perda desde o pico exceder o limite
-- Pausa todas as operações por X segundos
-- Requer reinicialização manual ou expiração do tempo
+1. **A cada 30 ciclos** (`RECONCILE_FULL_SYNC_INTERVAL_CYCLES`): resincroniza posições, ordens e saldo com a DEX (não apenas no boot).
+2. **Para cada símbolo habilitado:** busca OHLCV + funding rate → indicadores → sinal → filtros de proteção → sizing → validação de liquidação → execução.
+3. Verifica **fechamentos externos** (posições fechadas fora do bot).
+4. **Reconcilia estado** entre `CapitalProtection`, `PositionManager` e a DEX real — força resync se saldo divergir acima de $0.5.
+5. Atualiza saldo, dashboard e health check.
 
 ---
 
-## 💰 Staking
+## 🛡️ Sistema de Risco
 
-O bot suporta staking de HYPE e operações com vaults.
+### Camadas de Proteção (`capital_protection.py`)
 
-### Configuração
+| Nível | O quê | Configuração |
+|-------|-------|--------------|
+| **N1 — Mercado** | Horário, spread, funding rate | `RISK_TRADE_HOUR_*`, `RISK_MAX_SPREAD_PCT`, `RISK_MAX_FUNDING_RATE` |
+| **N2 — Drawdown** | Drawdown máximo, perda diária, perdas consecutivas, cooldown | `RISK_MAX_DRAWDOWN_PCT`, `RISK_DAILY_LOSS_LIMIT_PCT`, `RISK_MAX_CONSECUTIVE_LOSSES` |
+| **N3 — Exposição Bruta** | Limite por posição individual e total | `RISK_MAX_EXPOSURE_PCT`, `MAX_POSITION_PCT` |
+| **N3b — Exposição Correlacionada** | Trata todos os símbolos como um grupo de correlação único | `RISK_MAX_CORRELATED_EXPOSURE_PCT` |
+| **N4 — Circuit Breaker** | Pausa automática após perda severa | `RISK_CIRCUIT_BREAKER_LOSS_PCT`, `RISK_CIRCUIT_BREAKER_COOLDOWN_SEC` |
 
-```ini
-STAKING_ENABLED=true
-STAKING_VALIDATOR_ADDRESS=0x_endereco_do_validador
-STAKING_STAKE_PCT=10
-STAKING_VAULT_ADDRESS=0x_endereco_do_vault
-STAKING_VAULT_DEPOSIT_PCT=5
-STAKING_AUTO_COMPOUND=true
-```
+### Validação Pré-Trade de Liquidação (`risk.py`)
 
-### Funcionalidades
+Antes de cada ordem:
 
-- **Delegar stake:** Aloca HYPE para um validador
-- **Remover stake:** Retira HYPE de um validador
-- **Consultar recompensas:** Obtém histórico de recompensas
-- **Vault transfer:** Deposita/retira fundos de vaults
-- **Auto-compound:** Reinveste recompensas automaticamente
+- `calc_liquidation_price_estimate()` estima o preço de liquidação (aproximação, não o valor exato da exchange).
+- `validate_stop_loss_safety()` **aborta a ordem** se o SL estiver a menos de `LIQUIDATION_SAFETY_BUFFER_PCT` (**20%**, hardcoded) de folga da liquidação estimada.
 
----
+> ⚠️ Sempre mais crítico com **leverage alto + SL percentual apertado**.
 
-## 🔔 Notificações
+### Funding Acumulado no PnL
 
-Suporte a **3 canais** de notificação:
+- `PositionManager.accrue_funding()` acumula custo/receita de funding proporcional ao tempo em posição.
+- `record_close()` deduz isso do PnL líquido — evita PnL sistematicamente otimista em posições de longa duração.
 
-### Telegram
+### Trilha de Auditoria
 
-```ini
-NOTIFICATIONS_TELEGRAM_BOT_TOKEN=seu_token_aqui
-NOTIFICATIONS_TELEGRAM_CHAT_ID=seu_chat_id_aqui
-```
-
-### Discord
-
-```ini
-NOTIFICATIONS_DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
-```
-
-### Email (SMTP)
-
-```ini
-NOTIFICATIONS_SMTP_HOST=smtp.gmail.com
-NOTIFICATIONS_SMTP_PORT=587
-NOTIFICATIONS_SMTP_USER=seu_email@gmail.com
-NOTIFICATIONS_SMTP_PASSWORD=sua_senha
-NOTIFICATIONS_EMAIL_FROM=bot@exemplo.com
-NOTIFICATIONS_EMAIL_TO=admin@exemplo.com
-```
-
-### Eventos Notificados
-
-- ✅ Abertura de posição
-- ✅ Fechamento de posição (com PnL)
-- 🚨 Erros críticos
-- 📉 Drawdown excessivo
-- 📊 Resumo diário
+Todo trade fechado (interno ou externo) é gravado em `data/trades_live.jsonl` (append-only) via `TradeLedger` — sobrevive a restart, consultável via `read_all()` / `summary()`.
 
 ---
 
-## 📊 Dashboard
+## 🧠 Modo Ensemble
 
-O dashboard web local permite monitorar o bot em tempo real.
+Combina todas as estratégias de `ENABLED_STRATEGIES`, cada uma com um **score de confidence** (0–1). Só emite `buy`/`sell` quando:
 
-### Acesso
+1. Nº de estratégias concordando ≥ `ENSEMBLE_MIN_CONFLUENCE`
+2. Confiança média dessas ≥ `ENSEMBLE_MIN_AVG_CONFIDENCE`
 
-```
-http://localhost:8080
-```
-
-### Credenciais Padrão
-
-- **Usuário:** `admin`
-- **Senha:** `changeme`
-
-### Funcionalidades
-
-- Visualização de posições abertas
-- Gráficos de PnL
-- Histórico de trades
-- Métricas de performance
-- Health check do bot
+> 📈 Mais conservador (menos trades, potencialmente maior qualidade) que single-strategy. **Recomendação:** valide via `--mode backtest --ensemble` antes de ligar em produção — não há dados históricos de performance ainda para este modo.
 
 ---
 
-## 🐳 Docker
+## 📈 Estratégias — Catálogo Completo
 
-### Construir a imagem
+> ⚠️ **Regra geral:** nenhuma estratégia deve ser habilitada em `ENABLED_STRATEGIES` para produção sem antes rodar `--mode backtest` (idealmente `run_walk_forward()`) no símbolo/timeframe alvo.
+
+### 1. `trend_follow` ✅
+
+**Lógica:** EMA fast/slow + filtro de tendência (EMA 200) + RSI + ADX.
+
+| Parâmetro | Recomendação |
+|-----------|--------------|
+| `RISK_STOP_LOSS_PCT` | 2–3% |
+| `RISK_TAKE_PROFIT_PCT` | ≥ 2x o SL |
+| Timeframe | ≥ 1h |
+
+> 💡 Funciona melhor em timeframes ≥1h; em timeframes curtos gera muito ruído. Em mercado lateral (ADX baixo persistente) tende a operar contra a mão — considere combinar com `adaptive_trend` via ensemble.
+
+---
+
+### 2. `mean_reversion` ⚠️ (desabilitada por padrão)
+
+**Lógica:** Bollinger Bands + RSI em extremos.
+
+| Parâmetro | Recomendação |
+|-----------|--------------|
+| `RISK_STOP_LOSS_PCT` | 1.5% (mais apertado que o padrão) |
+| `RISK_MAX_CONSECUTIVE_LOSSES` | 2–3 |
+
+> ⚠️ Cripto tem **caudas gordas** — quedas "esticadas" continuam caindo com frequência maior que ativos tradicionais. Não recomendada como estratégia isolada em tendência forte — melhor em ranges confirmados (ADX baixo).
+
+---
+
+### 3. `adaptive_trend` ✅
+
+**Lógica:** Alterna trend/range conforme ADX.
+
+| Parâmetro | Recomendação |
+|-----------|--------------|
+| Padrão | Adequados |
+| Atenção | Monitore o campo `mode` retornado (`trend`/`range`/`hybrid`) |
+
+> 💡 Sinais em modo `hybrid` têm confiança fixa mais baixa (0.35) — considere um filtro adicional de tamanho de posição reduzido para esses.
+
+---
+
+### 4. `hybrid_regime` ✅ (recomendada para produção)
+
+**Lógica:** 3 camadas — regime macro (EMA 50/200) + VWAP sweep + estrutura (BOS).
+
+| Parâmetro | Recomendação |
+|-----------|--------------|
+| `RISK_STOP_LOSS_PCT` | 2.5–3% (um pouco mais largo) |
+
+> 💡 A mais robusta do conjunto. SL muito apertado tende a ser stopado por ruído antes do movimento de regime se confirmar.
+
+---
+
+### 5. `orderflow_delta` ⚠️ (desabilitada por padrão)
+
+**Lógica:** Delta CLV-ponderado (posição do fechamento no range da barra), com persistência de 3 barras e `absorption_threshold` funcional.
+
+> ⚠️ Ainda depende de **proxy de fluxo** (não trades reais tick-a-tick) — trate como sinal de confirmação, não como sinal primário isolado. **Recomendado apenas em ensemble**, nunca como única estratégia em produção real.
+
+---
+
+### 6. `scalping_grid` ⚠️ (desabilitada por padrão)
+
+**Lógica:** Grid multi-nível, espaçamento ATR-adaptativo com fallback percentual.
+
+| Parâmetro | Recomendação |
+|-----------|--------------|
+| `RISK_MAX_OPEN_TRADES` | 1–2 |
+
+> ⚠️ **Limitação:** não gerencia múltiplos níveis simultâneos abertos — cada sinal ainda abre uma única posição, não acumula por nível. Dado o timeframe curto e frequência de sinais, mantenha `RISK_MAX_OPEN_TRADES` baixo.
+
+---
+
+### 7. `funding_arbitrage` ⚠️ (desabilitada por padrão)
+
+**Lógica:** Opera contra funding extremo, sem considerar tendência.
+
+> ⚠️ Pode brigar contra tendências saudáveis (funding alto é normal em bull run). **Prefira `funding_weighted_trend`** em vez desta para uso em produção — mantida disponível apenas para quem quiser o comportamento de reversão pura.
+
+---
+
+### 8. `volatility_squeeze` 🆕 (não validada)
+
+**Lógica:** Detecta compressão de Bollinger Width seguida de rompimento com confirmação de volume.
+
+| Parâmetro | Recomendação |
+|-----------|--------------|
+| `RISK_STOP_LOSS_PCT` | Dinâmico via ATR (`atr_mult_sl` em `STRATEGY_DEFAULTS`) |
+| `RISK_TRAILING_STOP` | `true` |
+
+> ⚠️ Rompimentos falsos (fakeouts) são comuns logo após squeeze. **Validação obrigatória:** rode backtest em pelo menos 2 regimes de mercado (tendência e lateral) antes de habilitar.
+
+---
+
+### 9. `funding_weighted_trend` 🆕 (não validada)
+
+**Lógica:** Segue tendência apenas com carry favorável; reverte só em exaustão (funding extremo + RSI esticado).
+
+> 💡 Mais seletiva que `funding_arbitrage` — espere menos sinais. Adequada como componente do ensemble junto com `trend_follow`/`hybrid_regime` para reforçar confluência em vez de operar isolada.
+
+---
+
+## 📊 Gerenciamento de Risco — Recomendações Gerais
+
+| Regra | Detalhe |
+|-------|---------|
+| 🚫 **Nunca** desabilite proteção correlacionada | `RISK_MAX_CORRELATED_EXPOSURE_PCT=100` em portfólio multi-símbolo cripto é perigoso — BTC/ETH/SOL se movem em conjunto na maioria dos regimes. |
+| 🔗 **Leverage e SL andam juntos** | Com leverage ≥10x, confirme que `validate_stop_loss_safety()` não está abortando ordens silenciosamente. Se ocorrer com frequência, **reduza a leverage** do símbolo. |
+| ⏸️ **Circuit breaker não é opcional** | `RISK_CIRCUIT_BREAKER_LOSS_PCT` deve ser **sempre menor** que `RISK_MAX_DRAWDOWN_PCT` — o circuit breaker deve disparar **antes** do drawdown máximo ser atingido. |
+| 💰 **Funding em posições de swing** | Confirme que `accrue_funding()` está sendo chamado a cada ciclo (log `[FUNDING]` em modo DEBUG). Em posições longas, funding acumulado pode ser uma fração relevante do PnL. |
+| 🔐 **Dashboard = superfície de risco** | Trate a senha do dashboard como credencial de mesmo nível que a chave privada — quem acessa pode alterar SL/TP/drawdown em tempo real. |
+| 📋 **Auditoria contínua** | Revise `data/trades_live.jsonl` periodicamente (`TradeLedger.summary()`) para confirmar que o PnL líquido reportado bate com o extrato real da exchange. Divergência indica bug de sincronização não capturado pela reconciliação automática. |
+
+---
+
+## 🔬 Backtest — Uso Correto
 
 ```bash
-cd hl_bot_v3
-docker build -t hyperliquid-bot-v3 .
+# Testar estratégia NÃO habilitada em produção (bypass automático por padrão)
+python main.py --mode backtest --symbol BTC/USDC   # usa STRATEGY do .env
+
+# Simular fielmente o comportamento de produção
+python main.py --mode backtest --symbol BTC/USDC --respect-enabled-strategies
+
+# Testar o modo ensemble sem alterar o .env
+python main.py --mode backtest --symbol ETH/USDC --ensemble
 ```
 
-### Executar com Docker Compose
+> ✅ O campo **Símbolo** no summary/CSV agora reflete corretamente o símbolo passado via `--symbol` (bug corrigido — antes sempre mostrava o primeiro item de `SYMBOLS`).
 
-```bash
-docker-compose up -d
-```
-
-O `docker-compose.yml` inclui:
-- **Bot:** Serviço principal
-- **Prometheus:** Coleta de métricas (porta 9090)
-- **Grafana:** Visualização de métricas (porta 3000)
-
-### Parar
-
-```bash
-docker-compose down
-```
+Para validação de robustez temporal (múltiplas janelas), use `BacktestEngine.run_walk_forward()` programaticamente — ainda não exposto via CLI.
 
 ---
 
-## 🧪 Testes
+## 🔧 CI/CD e Qualidade de Código
 
-### Executar todos os testes
-
-```bash
-cd hl_bot_v3
-python -m pytest tests/ -v
-```
-
-### Executar testes de um módulo específico
-
-```bash
-python -m pytest tests/test_config.py -v
-python -m pytest tests/test_strategies.py -v
-python -m pytest tests/test_risk.py -v
-```
-
-### Cobertura
-
-```bash
-python -m pytest tests/ --cov=crypto_bot_core --cov-report=term
-```
+| Ferramenta | Escopo |
+|------------|--------|
+| **flake8** | Sintaxe e complexidade |
+| **mypy** | Bloqueante para `risk.py`, `capital_protection.py`, `trade_ledger.py`, `execution.py` (módulos auditados linha a linha); resto do projeto é informativo até auditoria completa. |
+| **pytest** | 483 testes, cobrindo estratégias, risco, execução, ledger, config, locks de concorrência, backtest. |
 
 ---
 
-## 📁 Estrutura do Projeto
+## ⚠️ Limitações Conhecidas
 
-```
-hl_bot_v3/
-├── main.py                          # Ponto de entrada principal
-├── .env                             # Configuração (NÃO commitar)
-├── .env.example                     # Template de configuração
-├── .gitignore                       # Arquivos ignorados
-├── requirements.txt                 # Dependências Python
-├── pyproject.toml                   # Config do projeto (pytest, mypy)
-├── Dockerfile                       # Build multi-stage
-├── docker-compose.yml               # Bot + Prometheus + Grafana
-├── README.md                        # Este arquivo
-│
-├── crypto_bot_core/                 # Código principal
-│   ├── __init__.py
-│   ├── config.py                    # Configuração Pydantic v2
-│   ├── indicators.py                # Indicadores técnicos
-│   ├── risk.py                      # Gerenciamento de risco
-│   ├── execution.py                 # Execução de ordens
-│   ├── capital_protection.py        # Proteção de capital
-│   ├── staking.py                   # Staking HYPE + vaults
-│   ├── notifications.py             # Notificações multicanal
-│   ├── monitoring.py                # Métricas e health check
-│   │
-│   ├── exchanges/                   # Conexão com exchanges
-│   │   ├── __init__.py
-│   │   └── hyperliquid.py           # Connector Hyperliquid
-│   │
-│   ├── strategies/                  # Estratégias de trading
-│   │   ├── __init__.py
-│   │   └── signals.py               # 7 estratégias
-│   │
-│   └── dashboard/                   # Dashboard web
-│       ├── __init__.py
-│       ├── static/                  # Arquivos estáticos
-│       └── templates/               # Templates HTML
-│
-├── tests/                           # Testes unitários
-│   ├── __init__.py
-│   ├── test_config.py               # 36 testes
-│   ├── test_exchange.py             # 21 testes
-│   ├── test_indicators.py           # 20 testes
-│   ├── test_strategies.py           # 60 testes
-│   ├── test_risk.py                 # 45 testes
-│   ├── test_execution.py            # 31 testes
-│   ├── test_capital_protection.py   # 29 testes
-│   ├── test_staking.py              # 9 testes
-│   ├── test_notifications.py        # 8 testes
-│   └── test_monitoring.py           # 12 testes
-│
-├── data/                            # Dados (logs, cache)
-├── scripts/                         # Scripts auxiliares
-└── venv/                            # Ambiente virtual (opcional)
-```
+> Não resolvidas nesta auditoria.
+
+| # | Limitação | Impacto |
+|---|-----------|---------|
+| 1 | `scalping_grid` não gerencia múltiplos níveis simultâneos abertos | Cada sinal abre posição única |
+| 2 | `mean_reversion` sem filtro de regime de tendência | Pode operar contra tendência forte |
+| 3 | Estimativa de liquidação usa margem de manutenção fixa (3%), não os tiers reais por ativo da Hyperliquid | Aproximação, não valor exato |
+| 4 | `ensemble_mode` e as duas novas estratégias carecem de validação histórica de performance | Apenas testadas unitariamente |
+| 5 | `_test_config.py` na raiz é código morto | Pode ser removido a qualquer momento sem impacto |
 
 ---
 
-## 🔒 Segurança
+## 🗺️ Roadmap e Próximos Passos
 
-- **NUNCA** commite o arquivo `.env` com credenciais reais
-- Use **testnet** para testes (`TESTNET=true`)
-- A private key da Hyperliquid é a mesma da sua carteira Ethereum
-- Mantenha o bot em um ambiente seguro (VPS com firewall)
-- Ative notificações para ser alertado de eventos críticos
-
----
-
-## 📚 Referências
-
-- [Hyperliquid DEX](https://hyperliquid.xyz)
-- [Hyperliquid Docs](https://hyperliquid.gitbook.io)
-- [Hyperliquid Python SDK](https://github.com/hyperliquid-dex/hyperliquid-python-sdk)
-- [Hyperliquid Testnet](https://app.hyperliquid-testnet.xyz)
+- [ ] Validação histórica de `ensemble_mode` e estratégias novas (`volatility_squeeze`, `funding_weighted_trend`)
+- [ ] Suporte a múltiplos níveis simultâneos no `scalping_grid`
+- [ ] Filtro de regime de tendência no `mean_reversion`
+- [ ] Tiers reais de liquidação por ativo da Hyperliquid
+- [ ] Expôr `run_walk_forward()` via CLI
+- [ ] Auditoria completa do restante do projeto (mypy bloqueante em todos os módulos)
 
 ---
 
 ## 📄 Licença
 
-Este projeto é fornecido apenas para fins educacionais. Use por sua conta e risco em produção.
+Este projeto é de uso privado e educacional. Não compartilhe credenciais ou `.env` em repositórios públicos.
+
+---
+
+> *Manual gerado para Hyperliquid Production Bot v3.0 — última atualização: 2026-07-29*

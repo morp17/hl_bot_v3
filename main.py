@@ -6,9 +6,7 @@ Bot de trading automatizado para Hyperliquid DEX.
 Modos de operação:
 - live: Trading real (requer credenciais)
 - backtest: Backtesting com dados históricos
-- dashboard: Servidor web local para monitoramento (modo standalone
-  de debug — no modo live, o dashboard já sobe automaticamente como
-  thread em background dentro do mesmo processo)
+- dashboard: Servidor web local para monitoramento
 
 Uso:
     python main.py --mode live
@@ -39,25 +37,26 @@ from crypto_bot_core.risk import (
     CHECK_EXITS_MISS_THRESHOLD,
     Position,
     PositionManager,
+    calc_liquidation_price_estimate,
     calc_position_size,
     calc_stops,
     trade_hours_ok,
+    validate_stop_loss_safety,
 )
 from crypto_bot_core.health_server import HealthServer, update_health
 from crypto_bot_core.lock import LockManager
 from crypto_bot_core.staking import StakingManager
-from crypto_bot_core.strategies.signals import get_signal
+from crypto_bot_core.strategies.signals import get_signal, get_ensemble_signal
+from crypto_bot_core.trade_ledger import get_ledger
 
 
 # ──────────────────────────────────────────────
 # Constantes
 # ──────────────────────────────────────────────
 
-# Valor mínimo de ordem exigido pela Hyperliquid. Abaixo disso a API
-# rejeita com "Order must have minimum value of $10" — checar ANTES
-# de enviar evita uma chamada de API fadada a falhar e o log de erro
-# ruidoso correspondente a cada ciclo.
 MIN_ORDER_NOTIONAL_USD = 10.0
+RECONCILE_FULL_SYNC_INTERVAL_CYCLES = 30
+STATE_RECONCILE_EPSILON_USD = 0.5
 
 
 # ──────────────────────────────────────────────
@@ -70,7 +69,7 @@ class HyperliquidBot:
     Bot principal de trading para Hyperliquid.
 
     Integra todos os módulos:
-    - Config → Estratégia → Sinais → Risco → Execução → Monitoramento
+    - Config → Estratégia(s) → Sinais → Risco → Execução → Monitoramento
     """
 
     def __init__(self, cfg: BotConfig) -> None:
@@ -88,7 +87,6 @@ class HyperliquidBot:
         self.running = False
         self.paused = False
 
-        # Lock file para prevenir múltiplas instâncias
         self._lock = LockManager()
         if not self._lock.acquire():
             raise RuntimeError(
@@ -97,10 +95,9 @@ class HyperliquidBot:
                 "ou use --force para sobrescrever."
             )
 
-        # Módulos
-        r = cfg.risk  # atalho para RiskConfig
-        n = cfg.notifications  # atalho para NotificationConfig
-        s = cfg.staking  # atalho para StakingConfig
+        r = cfg.risk
+        n = cfg.notifications
+        s = cfg.staking
 
         self.executor = OrderExecutor(cfg)
         self.position_manager = PositionManager(
@@ -114,7 +111,7 @@ class HyperliquidBot:
             trailing_activation_pct=r.trailing_stop_activation_pct / 100.0,
             trailing_stop_pct=r.trailing_stop_distance_pct / 100.0,
             taker_fee=r.taker_fee,
-            max_position_pct=cfg.max_position_pct / 100.0,   # FIX item 1/4
+            max_position_pct=cfg.max_position_pct / 100.0,
         )
         self.capital_protection = CapitalProtection(
             initial_balance=cfg.capital_usd,
@@ -129,10 +126,8 @@ class HyperliquidBot:
             trade_hour_start_utc=r.trade_hour_start_utc,
             trade_hour_end_utc=r.trade_hour_end_utc,
             max_spread_pct=r.max_spread_pct / 100.0,
-            max_funding_rate=r.max_funding_rate / 100.0,
-            # FIX item 4 auditoria: btc_crash_filter_pct removido de
-            # RiskConfig (campo morto sem verificação implementada) —
-            # também removido daqui.
+            max_funding_rate=r.max_funding_rate_fraction,   # FIX item 2: usa property centralizada
+            max_correlated_exposure_pct=r.max_correlated_exposure_pct / 100.0,
         )
         self.notificator = Notificator(
             telegram_token=n.telegram_bot_token or None,
@@ -147,26 +142,22 @@ class HyperliquidBot:
         )
         self.staking = StakingManager(cfg)
         self.monitor = Monitor()
+        self.ledger = get_ledger()
 
-        # Healthcheck server (thread separada, porta 8081)
         self._health_server = HealthServer(
             host=cfg.dashboard.host,
             port=cfg.monitoring.health_check_port,
         )
         self._health_server.start()
 
-        # Dashboard server (FIX arquitetural: roda como thread DENTRO
-        # deste processo, não mais como --mode dashboard separado —
-        # ver crypto_bot_core/dashboard/main.py::start_dashboard_thread)
         from crypto_bot_core.dashboard.main import start_dashboard_thread
         self._dashboard_thread = start_dashboard_thread(cfg)
 
-        # Estado
-        self._symbols: List[SymbolConfig] = []   # ALTERADO: era List[str]
+        self._symbols: List[SymbolConfig] = []
         self._last_signals: Dict[str, str] = {}
         self._synced_from_exchange: bool = False
+        self._cycle_count: int = 0
 
-        # ── Aplicar leverage/margem por símbolo (FIX item 3: antes nunca era chamado) ──
         try:
             symbol_configs = self.cfg.parse_symbols()
             for sc in symbol_configs:
@@ -187,7 +178,14 @@ class HyperliquidBot:
 
         log.info("=" * 50)
         log.info("Hyperliquid Production Bot v3.0")
-        log.info(f"Estratégia: {cfg.strategy.value}")
+        if cfg.ensemble_mode:
+            log.info(
+                f"Modo de sinal: ENSEMBLE (estratégias: {cfg.enabled_strategies} | "
+                f"min_confluencia={cfg.ensemble_min_confluence} | "
+                f"min_confianca_media={cfg.ensemble_min_avg_confidence:.2f})"
+            )
+        else:
+            log.info(f"Modo de sinal: SINGLE-STRATEGY ({cfg.strategy.value})")
         log.info(f"Símbolos: {cfg.symbols}")
         log.info(f"Capital: ${cfg.capital_usd:,.2f}")
         log.info("=" * 50)
@@ -198,7 +196,6 @@ class HyperliquidBot:
             return self.cfg.parse_symbols()
         except Exception as e:
             log.error(f"Erro ao carregar símbolos: {e}")
-            # fallback mínimo
             from crypto_bot_core.config import SymbolConfig as _SC
             return [
                 _SC(symbol=s, coin=s.split("/")[0])
@@ -209,32 +206,17 @@ class HyperliquidBot:
         """
         Normaliza símbolo do formato ccxt (ex: 'ETH/USDC:USDC') para
         o formato padrão do bot (ex: 'ETH/USDC').
-
-        O ccxt Hyperliquid retorna símbolos no formato 'BASE/QUOTE:QUOTE'
-        para perpétuos (ex: 'ETH/USDC:USDC'), enquanto o bot usa
-        o formato simples 'BASE/QUOTE' (ex: 'ETH/USDC').
         """
-        # Remove sufixo :USDC, :USD, etc.
         if ":" in raw_symbol:
             raw_symbol = raw_symbol.split(":")[0]
         return raw_symbol
 
     def _sync_from_exchange(self) -> None:
-        """
-        Sincroniza posições e ordens abertas da DEX no startup.
-
-        REGRAS:
-        1. CANCELA APENAS ordens órfãs (TP/SL sem posição correspondente).
-           NÃO cancela ordens limit que ainda não preencheram (FIX bugC8).
-        2. Restaura posições reais da Hyperliquid para o PositionManager
-           local, normalizando símbolos do formato ccxt (:USDC).
-        3. Ajusta peak_balance para o saldo REAL da exchange, não o .env.
-        """
+        """Sincroniza posições e ordens abertas da DEX (idempotente, chamada periodicamente)."""
         try:
             connector = self.executor.connector
             log.info("[SYNC] Sincronizando posições da DEX...")
 
-            # ── PASSO 0: Buscar posições abertas primeiro ──
             dex_positions = connector.fetch_positions()
             active_symbols: set = set()
             if dex_positions:
@@ -247,16 +229,6 @@ class HyperliquidBot:
                     if symbol and contracts > 0:
                         active_symbols.add(symbol)
 
-            # ── PASSO 1: Cancelar APENAS ordens órfãs ──
-            # FIX CRÍTICO (achado em teste ao vivo): além de decidir
-            # cancelar ou manter, agora também coletamos os preços das
-            # ordens MANTIDAS (TP/SL reais já na exchange) por símbolo,
-            # para popular corretamente Position.stop_loss/take_profit
-            # no PASSO 2 — antes esses campos ficavam sempre em 0.0 para
-            # posições restauradas, e check_exits() fechava a posição
-            # no ciclo seguinte por engano (price >= 0.0 é sempre
-            # verdadeiro para SELL). Ver correção complementar em
-            # risk.py::check_exits (guarda contra SL/TP não inicializado).
             kept_order_prices_by_symbol: Dict[str, List[float]] = {}
             try:
                 open_orders = connector.info.open_orders(connector.cfg.hyperliquid_account_address)
@@ -288,7 +260,6 @@ class HyperliquidBot:
             except Exception as e:
                 log.debug(f"[SYNC] Erro ao cancelar ordens órfãs: {e}")
 
-            # ── PASSO 2: Restaurar posições da DEX ──
             if dex_positions:
                 for dp in dex_positions:
                     if not isinstance(dp, dict):
@@ -309,11 +280,6 @@ class HyperliquidBot:
                         log.debug(f"[SYNC] Posição {symbol} já existe localmente")
                         continue
 
-                    # FIX CRÍTICO: inferir stop_loss/take_profit reais a
-                    # partir dos preços das ordens trigger mantidas na
-                    # exchange (coletadas no PASSO 1), em vez de deixar
-                    # em 0.0. Para SELL: SL fica ACIMA da entrada, TP
-                    # fica ABAIXO. Para BUY: o inverso.
                     order_prices = kept_order_prices_by_symbol.get(symbol, [])
                     restored_sl, restored_tp = 0.0, 0.0
                     if len(order_prices) >= 2:
@@ -330,18 +296,14 @@ class HyperliquidBot:
                     elif len(order_prices) == 1:
                         log.warning(
                             f"[SYNC] {symbol}: apenas 1 ordem trigger encontrada "
-                            f"({order_prices[0]}) — não é possível distinguir "
-                            f"SL de TP com segurança. Posição restaurada SEM "
-                            f"stop automático local (proteção real ainda existe "
-                            f"na exchange via a ordem trigger restante, mas "
-                            f"check_exits() do bot não vai fechá-la)."
+                            f"({order_prices[0]}) — posição restaurada SEM stop "
+                            f"automático local."
                         )
                     else:
                         log.warning(
                             f"[SYNC] {symbol}: nenhuma ordem trigger encontrada "
                             f"na exchange — posição restaurada SEM stop_loss/"
-                            f"take_profit locais. Considere fechar manualmente "
-                            f"ou recriar TP/SL via dashboard/exchange."
+                            f"take_profit locais."
                         )
 
                     pos = Position(
@@ -351,28 +313,19 @@ class HyperliquidBot:
                         qty=contracts,
                         stop_loss=restored_sl,
                         take_profit=restored_tp,
-                        trailing_stop_price=restored_sl,  # consistente com _process_symbol
+                        trailing_stop_price=restored_sl,
                         open_time=time.time(),
                     )
                     self.position_manager.add(pos)
                     log.info(f"[SYNC] Posição restaurada da DEX: {side.upper()} {contracts} {symbol} @ {entry_price}")
 
-            # ── PASSO 3: Log ordens abertas restantes (se houver) ──
             try:
                 remaining_orders = connector.info.open_orders(connector.cfg.hyperliquid_account_address)
                 if remaining_orders:
                     log.info(f"[SYNC] {len(remaining_orders)} ordem(ns) restante(s) na DEX (após cancelamento)")
-                    for o in remaining_orders:
-                        if isinstance(o, dict):
-                            coin = o.get("coin", "")
-                            oid = o.get("oid", "")
-                            sz = o.get("sz", "0")
-                            limit_px = o.get("limitPx", "0")
-                            log.debug(f"[SYNC] Ordem: {coin} oid={oid} sz={sz} @ {limit_px}")
             except Exception as e:
                 log.debug(f"[SYNC] Erro ao buscar ordens restantes: {e}")
 
-            # ── PASSO 4: Atualizar saldo real da DEX ──
             try:
                 balance_info = connector.fetch_balance()
                 if balance_info and isinstance(balance_info, dict):
@@ -388,14 +341,8 @@ class HyperliquidBot:
                         old_peak = self.capital_protection.state.peak_balance
                         if free_balance < old_peak:
                             self.capital_protection.state.peak_balance = free_balance
-                            log.info(
-                                f"[SYNC] Peak reajustado: ${old_peak:.2f} → "
-                                f"${free_balance:.2f} (saldo real < capital config)"
-                            )
                         else:
-                            self.capital_protection.state.peak_balance = max(
-                                old_peak, free_balance
-                            )
+                            self.capital_protection.state.peak_balance = max(old_peak, free_balance)
 
                         self.position_manager.current_balance = self.capital_protection.state.current_balance
                         self.position_manager.peak_balance = self.capital_protection.state.peak_balance
@@ -411,14 +358,8 @@ class HyperliquidBot:
             log.error(f"[SYNC] Erro na sincronização: {e}")
 
     def _verify_positions_on_exchange(self) -> None:
-        """
-        Verifica periodicamente se as posições locais ainda existem na DEX.
-
-        NOTA 2 (FIX bugC8): Posições com menos de VERIFY_GRACE_PERIOD segundos
-        NÃO são removidas automaticamente, para não tratar como "fechada
-        externamente" uma ordem limit que ainda está resting.
-        """
-        VERIFY_GRACE_PERIOD = 120  # segundos — período de carência
+        """Verifica periodicamente se as posições locais ainda existem na DEX."""
+        VERIFY_GRACE_PERIOD = 120
         now = time.time()
 
         try:
@@ -442,11 +383,6 @@ class HyperliquidBot:
             for pos in list(self.position_manager.positions):
                 age = now - pos.open_time
                 if pos.symbol not in active_symbols and age < VERIFY_GRACE_PERIOD:
-                    log.debug(
-                        f"[VERIFY] {pos.symbol} ausente na DEX mas tem "
-                        f"apenas {age:.0f}s (grace={VERIFY_GRACE_PERIOD}s) — "
-                        f"ordem limit ainda não preenchida, mantendo"
-                    )
                     continue
 
                 if pos.symbol not in active_symbols:
@@ -464,9 +400,26 @@ class HyperliquidBot:
                         * pos.qty
                         * (1 if pos.side == "buy" else -1)
                     )
-                    net_pnl = gross - fee
+                    funding_cost = pos.accrued_funding
+                    net_pnl = gross - fee - funding_cost
 
                     self.position_manager.positions.remove(pos)
+
+                    self.capital_protection.record_trade_result(net_pnl)
+                    self.monitor.record_trade(net_pnl)
+                    self.ledger.record(
+                        symbol=pos.symbol,
+                        side=pos.side,
+                        entry_price=pos.entry_price,
+                        exit_price=exit_price,
+                        qty=pos.qty,
+                        gross_pnl=gross,
+                        fee=fee,
+                        funding_cost=funding_cost,
+                        net_pnl=net_pnl,
+                        exit_reason="close_external",
+                        open_time=pos.open_time,
+                    )
 
                     self.notificator.send_trade_alert(
                         action="close_external",
@@ -478,20 +431,61 @@ class HyperliquidBot:
                     )
                     log.info(
                         f"[VERIFY] {pos.symbol} fechada externamente: "
-                        f"PnL estimado={net_pnl:+.4f}"
+                        f"PnL estimado={net_pnl:+.4f} (funding={funding_cost:+.4f})"
                     )
 
         except Exception as e:
             log.debug(f"[VERIFY] Erro ao verificar posições na DEX: {e}")
+
+    def _reconcile_state(self) -> None:
+        """Checagem cruzada entre as fontes de estado do bot."""
+        try:
+            cp_balance = self.capital_protection.state.current_balance
+            pm_balance = self.position_manager.current_balance
+
+            if abs(cp_balance - pm_balance) > STATE_RECONCILE_EPSILON_USD:
+                log.error(
+                    f"[RECONCILE] DIVERGÊNCIA DE SALDO: CapitalProtection="
+                    f"${cp_balance:.2f} vs PositionManager=${pm_balance:.2f}. "
+                    f"Forçando resincronização completa com a DEX."
+                )
+                self._sync_from_exchange()
+                return
+
+            cp_peak = self.capital_protection.state.peak_balance
+            pm_peak = self.position_manager.peak_balance
+            if abs(cp_peak - pm_peak) > STATE_RECONCILE_EPSILON_USD:
+                log.warning(
+                    f"[RECONCILE] Divergência de peak_balance: "
+                    f"CapitalProtection=${cp_peak:.2f} vs "
+                    f"PositionManager=${pm_peak:.2f} — sincronizando."
+                )
+                self.position_manager.peak_balance = cp_peak
+
+            local_positions = len(self.position_manager.positions)
+            try:
+                dex_positions = self.executor.connector.fetch_positions()
+                dex_active = sum(
+                    1 for dp in (dex_positions or [])
+                    if isinstance(dp, dict) and float(dp.get("contracts", 0) or 0) > 0
+                )
+                if local_positions != dex_active:
+                    log.warning(
+                        f"[RECONCILE] Contagem de posições diverge: "
+                        f"local={local_positions} vs DEX={dex_active}."
+                    )
+            except Exception as e:
+                log.debug(f"[RECONCILE] Erro ao verificar posições na DEX: {e}")
+
+        except Exception as e:
+            log.error(f"[RECONCILE] Erro na reconciliação de estado: {e}")
 
     async def _process_symbol(self, sym_cfg: SymbolConfig) -> None:
         """
         Processa um símbolo: busca dados, gera sinal, executa.
 
         Args:
-            sym_cfg: Configuração específica do símbolo (estratégia,
-                timeframe, risco e leverage podem sobrescrever os
-                globais — ver SymbolConfig).
+            sym_cfg: Configuração específica do símbolo.
         """
         symbol = sym_cfg.symbol
         try:
@@ -499,11 +493,9 @@ class HyperliquidBot:
 
             connector = self.executor.connector
 
-            # Estratégia/timeframe efetivos: override do símbolo > global (FIX item 4)
             effective_strategy = sym_cfg.strategy or self.cfg.strategy
             effective_timeframe = sym_cfg.timeframe or self.cfg.timeframe
 
-            # 1. Buscar dados OHLCV
             ohlcv_data = connector.fetch_ohlcv(symbol, effective_timeframe.value, limit=350)
 
             if ohlcv_data is None or len(ohlcv_data) == 0:
@@ -515,29 +507,33 @@ class HyperliquidBot:
                 columns=["timestamp", "open", "high", "low", "close", "volume"],
             )
 
-            # 1b. Buscar funding rate atual (FIX item 5)
             coin = symbol.replace("/USDC", "").replace("/USD", "")
             funding_rate = connector.get_current_funding_rate(coin)
 
-            # 2. Adicionar indicadores (com funding rate real)
             df = add_all_indicators(df, self.cfg, funding_rate=funding_rate)
 
-            # 3. Gerar sinal — troca temporária de cfg.strategy/timeframe
-            #    se houver override no símbolo (limitação documentada:
-            #    get_strategy_params ainda lê cfg global, não por símbolo)
-            original_strategy, original_timeframe = self.cfg.strategy, self.cfg.timeframe
-            if sym_cfg.strategy or sym_cfg.timeframe:
-                self.cfg.strategy = effective_strategy
-                self.cfg.timeframe = effective_timeframe
-            try:
-                signal, params = get_signal(df, self.cfg)
-            finally:
-                self.cfg.strategy, self.cfg.timeframe = original_strategy, original_timeframe
+            # FIX (auditoria — item 9): geração de sinal agora suporta
+            # dois modos — ensemble (combina todas as estratégias
+            # habilitadas, ponderadas por confiança) ou single-strategy
+            # (comportamento original, uma única estratégia por vez).
+            # O modo é escolhido via cfg.ensemble_mode (default False —
+            # não altera o comportamento de instalações existentes).
+            if self.cfg.ensemble_mode:
+                signal, params = get_ensemble_signal(df, self.cfg)
+            else:
+                original_strategy, original_timeframe = self.cfg.strategy, self.cfg.timeframe
+                if sym_cfg.strategy or sym_cfg.timeframe:
+                    self.cfg.strategy = effective_strategy
+                    self.cfg.timeframe = effective_timeframe
+                try:
+                    signal, params = get_signal(df, self.cfg)
+                finally:
+                    self.cfg.strategy, self.cfg.timeframe = original_strategy, original_timeframe
 
+            signal_confidence = float(params.get("confidence", 0.0))
             self._last_signals[symbol] = signal
             self.monitor.update_signal(signal)
 
-            # 4. Buscar spread para checagem de proteção (FIX item 2 capital_protection)
             spread_pct = None
             try:
                 ticker = connector.fetch_ticker(symbol)
@@ -549,7 +545,6 @@ class HyperliquidBot:
             except Exception as e:
                 log.debug(f"[{symbol}] Erro ao buscar spread: {e}")
 
-            # 5. Verificar proteções (agora com spread e funding)
             protection_ok, reasons = self.capital_protection.check_all(
                 spread_pct=spread_pct,
                 funding_rate=funding_rate,
@@ -558,7 +553,6 @@ class HyperliquidBot:
                 log.info(f"[{symbol}] Proteção bloqueou: {reasons}")
                 return
 
-            # 6. Extrair valores mais recentes
             latest = get_latest_values(df)
             close_price = latest.get("close", 0)
 
@@ -573,7 +567,14 @@ class HyperliquidBot:
                     )
                     close_price = mark_px
 
-            # 7. Verificar posição existente
+            if funding_rate:
+                funding_ref_price = mark_px if (mark_px and mark_px > 0) else close_price
+                self.position_manager.accrue_funding(
+                    symbol=symbol,
+                    funding_rate=funding_rate,
+                    mark_price=funding_ref_price,
+                )
+
             existing_positions = [
                 p for p in self.position_manager.positions
                 if p.symbol == symbol
@@ -583,15 +584,12 @@ class HyperliquidBot:
                 await self._check_exits_for_symbol(symbol, close_price, mark_px)
                 return
 
-            # 8. Verificar limite de trades
             if signal in ("buy", "sell"):
                 can_open, reason = self.position_manager.can_open()
                 if not can_open:
                     log.info(f"[{symbol}] PositionManager bloqueou: {reason}")
                     return
 
-                # 9. Sizing — usa risco/max_position por símbolo (FIX item 1+4)
-                #    e stop_loss_pct compartilhado com calc_stops (FIX item 2)
                 atr = latest.get("atr", 0)
                 balance = self.position_manager.current_balance
 
@@ -612,21 +610,37 @@ class HyperliquidBot:
                     log.warning(f"[{symbol}] Quantidade calculada = 0")
                     return
 
-                # 9b. Guarda de valor mínimo de ordem (achado em teste ao
-                # vivo — Hyperliquid rejeita notional < $10; melhor
-                # detectar aqui do que gastar uma chamada de API fadada
-                # a falhar e poluir os logs a cada ciclo).
                 notional = qty * close_price
                 if notional < MIN_ORDER_NOTIONAL_USD:
                     log.warning(
                         f"[{symbol}] Ordem abaixo do mínimo da exchange "
-                        f"(${notional:.2f} < ${MIN_ORDER_NOTIONAL_USD:.2f}) — "
-                        f"pulando. Aumente capital_usd ou risk_per_trade_pct "
-                        f"para operar este símbolo com o capital atual."
+                        f"(${notional:.2f} < ${MIN_ORDER_NOTIONAL_USD:.2f}) — pulando."
                     )
                     return
 
-                # 10. Stops — mesma stop_loss_pct usada no sizing acima
+                total_notional_all = sum(
+                    p.qty * p.entry_price for p in self.position_manager.positions
+                )
+
+                exposure_ok, exposure_reason = self.capital_protection.check_exposure(
+                    current_positions_value=total_notional_all,
+                    new_position_value=notional,
+                )
+                if not exposure_ok:
+                    log.info(f"[{symbol}] Bloqueado por exposição (Nível 3): {exposure_reason}")
+                    return
+
+                corr_ok, corr_reason = self.capital_protection.check_correlated_exposure(
+                    total_notional_all_positions=total_notional_all,
+                    new_position_notional=notional,
+                )
+                if not corr_ok:
+                    log.info(
+                        f"[{symbol}] Bloqueado por exposição correlacionada "
+                        f"(Nível 3b): {corr_reason}"
+                    )
+                    return
+
                 sl, tp = calc_stops(
                     price=close_price,
                     side=signal,
@@ -636,7 +650,27 @@ class HyperliquidBot:
                     df=df,
                 )
 
-                # 11. Executar ordem
+                liq_price_est = calc_liquidation_price_estimate(
+                    entry_price=close_price,
+                    side=signal,
+                    leverage=sym_cfg.leverage,
+                    is_cross=not sym_cfg.isolated_margin,
+                )
+                sl_safe, sl_reason = validate_stop_loss_safety(
+                    stop_loss=sl,
+                    liquidation_price=liq_price_est,
+                    side=signal,
+                )
+                if not sl_safe:
+                    log.error(
+                        f"[{symbol}] ORDEM ABORTADA por segurança de liquidação: "
+                        f"SL={sl:.4f} próximo da liquidação estimada "
+                        f"(${liq_price_est:.4f}) com leverage {sym_cfg.leverage}x — "
+                        f"{sl_reason}."
+                    )
+                    self.monitor.record_error(f"SL inseguro em {symbol}: {sl_reason}")
+                    return
+
                 result = self.executor.place_bulk_tpsl(
                     symbol=symbol,
                     side=signal,
@@ -689,10 +723,6 @@ class HyperliquidBot:
                             qty=qty,
                             stop_loss=sl,
                             take_profit=tp,
-                            # FIX CRÍTICO: inicializar trailing_stop_price
-                            # com o SL — evita que o default 0.0 dispare
-                            # check_exits() para SELL instantaneamente
-                            # (ver correção em risk.py::check_exits).
                             trailing_stop_price=sl,
                             open_time=time.time(),
                         )
@@ -714,7 +744,8 @@ class HyperliquidBot:
 
                         log.info(
                             f"[{symbol}] {signal.upper()} {qty} @ {close_price} "
-                            f"| TP={tp} | SL={sl}"
+                            f"| TP={tp} | SL={sl} | conf={signal_confidence:.2f} "
+                            f"| Liq.est≈{liq_price_est:.2f}"
                         )
                     else:
                         log.info(
@@ -739,17 +770,7 @@ class HyperliquidBot:
         close_price: float,
         mark_px: Optional[float] = None,
     ) -> None:
-        """
-        Verifica se posições do símbolo atual devem ser fechadas.
-
-        Usa o mark price real da DEX em vez do close_price do OHLCV
-        para evitar falsos positivos de SL/TP.
-
-        Args:
-            symbol: Símbolo a verificar.
-            close_price: Preço de fechamento do OHLCV.
-            mark_px: Mark price real da DEX (opcional).
-        """
+        """Verifica se posições do símbolo atual devem ser fechadas."""
         try:
             check_price = close_price
             if mark_px and mark_px > 0:
@@ -765,6 +786,20 @@ class HyperliquidBot:
             to_close = self.position_manager.check_exits(check_price)
 
             for pos in to_close:
+                exit_reason = "manual"
+                if pos.take_profit > 0 and (
+                    (pos.side == "buy" and check_price >= pos.take_profit)
+                    or (pos.side == "sell" and check_price <= pos.take_profit)
+                ):
+                    exit_reason = "take_profit"
+                elif pos.stop_loss > 0 and (
+                    (pos.side == "buy" and check_price <= pos.stop_loss)
+                    or (pos.side == "sell" and check_price >= pos.stop_loss)
+                ):
+                    exit_reason = "stop_loss"
+                elif pos.trailing_stop_price > 0:
+                    exit_reason = "trailing_stop"
+
                 try:
                     connector = self.executor.connector
                     result_close_dex = connector.close_position(
@@ -779,10 +814,26 @@ class HyperliquidBot:
 
                 result_close = self.position_manager.record_close(pos, check_price)
                 if "error" not in result_close:
-                    self.capital_protection.record_trade_result(
-                        result_close.get("net_pnl", 0)
-                    )
+                    self.capital_protection.record_trade_result(result_close.get("net_pnl", 0))
                     self.monitor.record_trade(result_close.get("net_pnl", 0))
+
+                    self.ledger.record(
+                        symbol=result_close["symbol"],
+                        side=result_close["side"],
+                        entry_price=result_close["entry_price"],
+                        exit_price=result_close["exit_price"],
+                        qty=result_close["qty"],
+                        gross_pnl=result_close["gross_pnl"],
+                        fee=result_close["fee"],
+                        funding_cost=result_close.get("funding_cost", 0.0),
+                        net_pnl=result_close["net_pnl"],
+                        exit_reason=exit_reason,
+                        strategy=(
+                            "ensemble" if self.cfg.ensemble_mode else self.cfg.strategy.value
+                        ),
+                        open_time=result_close.get("open_time"),
+                    )
+
                     self.notificator.send_trade_alert(
                         action="close",
                         symbol=pos.symbol,
@@ -804,20 +855,28 @@ class HyperliquidBot:
             if self.paused:
                 return
 
+            self._cycle_count += 1
+
             if not self._symbols:
                 self._symbols = self._load_symbols()
 
             if not self._synced_from_exchange:
                 self._sync_from_exchange()
+            elif self._cycle_count % RECONCILE_FULL_SYNC_INTERVAL_CYCLES == 0:
+                log.info(
+                    f"[SYNC] Resincronização periódica completa "
+                    f"(ciclo {self._cycle_count})"
+                )
+                self._sync_from_exchange()
 
             for sym_cfg in self._symbols:
                 if not sym_cfg.enabled:
                     continue
-                await self._process_symbol(sym_cfg)   # ALTERADO: passa SymbolConfig, não string
+                await self._process_symbol(sym_cfg)
 
             self._verify_positions_on_exchange()
+            self._reconcile_state()
 
-            # Atualizar saldo
             try:
                 connector = self.executor.connector
                 balance_info = connector.fetch_balance()
@@ -840,7 +899,6 @@ class HyperliquidBot:
             except Exception as e:
                 log.debug(f"Erro ao atualizar saldo: {e}")
 
-            # Staking automático (se configurado)
             if self.cfg.staking.enabled and self.cfg.staking.validator_address:
                 try:
                     summary = self.staking.get_staking_summary()
@@ -851,7 +909,6 @@ class HyperliquidBot:
 
             self.monitor.record_step(success=True)
 
-            # ── Atualizar Dashboard State ──
             try:
                 from crypto_bot_core.dashboard.main import update_state
 
@@ -864,13 +921,12 @@ class HyperliquidBot:
                         "entry_price": pos.entry_price,
                         "stop_loss": pos.stop_loss,
                         "take_profit": pos.take_profit,
+                        "accrued_funding": pos.accrued_funding,
                     })
 
                 metrics = self.monitor.get_metrics()
                 metrics.update({
                     "total_pnl": self.position_manager.pnl_today,
-                    # FIX: BotMetrics não tem atributo win_rate — o valor
-                    # já calculado está em metrics["trading"]["win_rate_pct"].
                     "win_rate": metrics["trading"]["win_rate_pct"],
                     "current_balance": self.capital_protection.state.current_balance,
                     "peak_balance": self.capital_protection.state.peak_balance,
@@ -878,6 +934,8 @@ class HyperliquidBot:
                         (self.capital_protection.state.peak_balance - self.capital_protection.state.current_balance)
                         / max(self.capital_protection.state.peak_balance, 1) * 100
                     ),
+                    "ledger_summary": self.ledger.summary(),
+                    "signal_mode": "ensemble" if self.cfg.ensemble_mode else "single_strategy",
                 })
 
                 update_state({
@@ -889,14 +947,11 @@ class HyperliquidBot:
             except Exception as e:
                 log.debug(f"Erro ao atualizar dashboard: {e}")
 
-            # ── Atualizar Healthcheck State ──
             try:
                 update_health({
                     "status": "online",
                     "last_step": time.time(),
                     "positions": len(self.position_manager.positions),
-                    # FIX: BotMetrics não tem atributo 'errors' — o
-                    # campo real de contagem de falhas é steps_failed.
                     "errors": self.monitor.metrics.steps_failed,
                 })
             except Exception as e:
@@ -925,7 +980,6 @@ class HyperliquidBot:
             try:
                 loop.add_signal_handler(sig, lambda: asyncio.create_task(self.stop()))
             except NotImplementedError:
-                # Windows não suporta add_signal_handler
                 pass
 
         try:
@@ -956,6 +1010,13 @@ class HyperliquidBot:
         log.info(f"PnL Total: ${metrics['trading']['total_pnl']:+,.2f}")
         log.info(f"Win Rate: {metrics['trading']['win_rate_pct']}%")
 
+        ledger_summary = self.ledger.summary()
+        log.info(
+            f"[LEDGER] Trilha de auditoria: {ledger_summary['total_trades']} "
+            f"trade(s) registrado(s), PnL líquido acumulado "
+            f"${ledger_summary['total_net_pnl']:+,.2f}"
+        )
+
         try:
             self._health_server.stop()
         except Exception:
@@ -983,12 +1044,130 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--load-json-overrides",
         action="store_true",
-        help="Carrega bot_config.json por cima do .env no startup "
-             "(útil para retomar ajustes feitos via dashboard em uma "
-             "sessão anterior). Sem esta flag, apenas .env é usado, e "
-             "o dashboard começa com os defaults do .env.",
+        help="Carrega bot_config.json por cima do .env no startup.",
+    )
+    parser.add_argument(
+        "--respect-enabled-strategies",
+        action="store_true",
+        help="No modo backtest, respeita cfg.enabled_strategies (mesmo "
+             "comportamento do live) em vez do default do backtest, que "
+             "ignora esse gate para permitir validar estratégias ainda "
+             "não habilitadas.",
+    )
+    parser.add_argument(
+        "--ensemble",
+        action="store_true",
+        help="No modo backtest, usa get_ensemble_signal() (combina "
+             "todas as estratégias de ENABLED_STRATEGIES ponderadas "
+             "por confiança) em vez da estratégia única (STRATEGY). "
+             "Equivalente a rodar o backtest com ENSEMBLE_MODE=true, "
+             "sem precisar alterar o .env — útil para validar o modo "
+             "ensemble antes de habilitá-lo em produção. Se omitida, "
+             "usa cfg.ensemble_mode (valor do .env) como default.",
     )
     return parser.parse_args()
+
+
+def _run_backtest(args: argparse.Namespace, cfg: BotConfig) -> None:
+    """Executa o modo backtest.
+
+    Busca dados históricos via exchange, calcula indicadores,
+    executa o BacktestEngine e exibe/exports o resultado.
+
+    FIX (suporte a ensemble_mode no backtest): a flag --ensemble (ou
+    ENSEMBLE_MODE=true no .env) faz o backtest usar
+    get_ensemble_signal() em vez de get_signal() — necessário para
+    validar o modo ensemble via dados históricos antes de habilitá-lo
+    em produção (ver BacktestEngine.ensemble_mode).
+
+    Args:
+        args: Argumentos da linha de comando.
+        cfg: Configuração do bot.
+    """
+    try:
+        from crypto_bot_core.backtest import BacktestEngine
+        from crypto_bot_core.indicators import add_all_indicators
+        from crypto_bot_core.exchanges.hyperliquid import get_connector
+
+        symbol = args.symbol or cfg.symbols.split(",")[0].strip()
+        log.info(f"[BACKTEST] Iniciando backtest para {symbol}...")
+
+        bypass = not args.respect_enabled_strategies
+        if bypass and not cfg.is_strategy_enabled():
+            log.info(
+                f"[BACKTEST] Estratégia '{cfg.strategy.value}' será testada "
+                f"mesmo NÃO estando em ENABLED_STRATEGIES — use "
+                f"--respect-enabled-strategies para simular o bloqueio "
+                f"real de produção."
+            )
+
+        # --ensemble na CLI tem prioridade; se omitida, usa o valor do
+        # .env (cfg.ensemble_mode) como default.
+        use_ensemble = args.ensemble or cfg.ensemble_mode
+        if use_ensemble:
+            log.info(
+                f"[BACKTEST] Modo ENSEMBLE ativo — combinando estratégias "
+                f"'{cfg.enabled_strategies}' (min_confluencia="
+                f"{cfg.ensemble_min_confluence}, min_confianca_media="
+                f"{cfg.ensemble_min_avg_confidence:.2f})"
+            )
+        else:
+            log.info(f"[BACKTEST] Modo SINGLE-STRATEGY ({cfg.strategy.value})")
+
+        connector = get_connector(cfg)
+        ohlcv = connector.fetch_ohlcv(
+            symbol,
+            cfg.timeframe.value,
+            limit=2000,
+        )
+
+        if not ohlcv or len(ohlcv) < 50:
+            log.error(
+                f"[BACKTEST] Dados históricos insuficientes para {symbol}: "
+                f"{len(ohlcv) if ohlcv else 0} candles"
+            )
+            return
+
+        df = pd.DataFrame(
+            ohlcv,
+            columns=["timestamp", "open", "high", "low", "close", "volume"],
+        )
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        df.set_index("timestamp", inplace=True)
+
+        log.info(
+            f"[BACKTEST] {len(df)} candles obtidos para {symbol} "
+            f"({df.index[0].strftime('%Y-%m-%d')} → "
+            f"{df.index[-1].strftime('%Y-%m-%d')})"
+        )
+
+        df = add_all_indicators(df, cfg)
+
+        engine = BacktestEngine(
+            cfg,
+            initial_capital=cfg.backtest.initial_capital,
+            bypass_enabled_strategies=bypass,
+            ensemble_mode=use_ensemble,
+        )
+        result = engine.run(df)
+
+        print()
+        print(result.summary())
+        print()
+
+        safe_symbol = symbol.replace("/", "_").replace(":", "_")
+        strategy_label = "ensemble" if use_ensemble else cfg.strategy.value
+        csv_path = (
+            f"backtest_{safe_symbol}_{strategy_label}_"
+            f"{cfg.timeframe.value}.csv"
+        )
+        result.export_csv(csv_path)
+
+        log.info(f"[BACKTEST] Resultado exportado para {csv_path}")
+
+    except Exception as e:
+        log.error(f"[BACKTEST] Erro fatal: {e}")
+        sys.exit(1)
 
 
 def setup_logging() -> None:
@@ -1025,6 +1204,19 @@ def _run_backtest(args: argparse.Namespace, cfg: BotConfig) -> None:
         symbol = args.symbol or cfg.symbols.split(",")[0].strip()
         log.info(f"[BACKTEST] Iniciando backtest para {symbol}...")
 
+        # FIX (achado na análise de logs/backtest): loga explicitamente
+        # qual modo de gate está em uso, para não haver ambiguidade
+        # sobre por que total_trades deu 0 (ou não) em uma estratégia
+        # fora de ENABLED_STRATEGIES.
+        bypass = not args.respect_enabled_strategies
+        if bypass and not cfg.is_strategy_enabled():
+            log.info(
+                f"[BACKTEST] Estratégia '{cfg.strategy.value}' será testada "
+                f"mesmo NÃO estando em ENABLED_STRATEGIES — use "
+                f"--respect-enabled-strategies para simular o bloqueio "
+                f"real de produção."
+            )
+
         connector = get_connector(cfg)
         ohlcv = connector.fetch_ohlcv(
             symbol,
@@ -1057,8 +1249,9 @@ def _run_backtest(args: argparse.Namespace, cfg: BotConfig) -> None:
         engine = BacktestEngine(
             cfg,
             initial_capital=cfg.backtest.initial_capital,
+            bypass_enabled_strategies=bypass,
         )
-        result = engine.run(df)
+        result = engine.run(df, symbol=symbol)
 
         print()
         print(result.summary())
@@ -1095,13 +1288,7 @@ def main_sync(args: argparse.Namespace, cfg: BotConfig) -> None:
 
 
 def main() -> None:
-    """Função principal.
-
-    FIX CRÍTICO (item de dispatch, achado em teste ao vivo): a versão
-    anterior carregava a configuração e retornava sem nunca despachar
-    para main_async()/main_sync() — o processo terminava silenciosamente
-    após 2 linhas de log, sem erro algum, sem nunca de fato rodar o bot.
-    """
+    """Função principal."""
     args = parse_args()
     setup_logging()
 

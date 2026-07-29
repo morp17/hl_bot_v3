@@ -9,6 +9,15 @@ necessário porque _dashboard_state é uma variável de módulo em memória:
 rodar o dashboard em um processo separado do bot fazia com que o estado
 nunca fosse compartilhado, e a página sempre mostrasse "offline".
 
+FIX CRÍTICO (auditoria — item 2): TODAS as rotas agora exigem HTTP
+Basic Auth (cfg.dashboard.user/password). Antes, qualquer pessoa com
+acesso de rede à porta do dashboard podia LER posições/saldo e
+ALTERAR parâmetros de risco em produção (POST /api/config) sem
+qualquer autenticação — vetor direto de perda financeira. Isso é
+independente do health_server.py (porta 8081), que permanece sem auth
+propositalmente, pois é consumido por probes de infraestrutura
+(Docker HEALTHCHECK) e não expõe nem permite alterar dados sensíveis.
+
 Requisitos:
 - Type hints
 - Tratamento de exceções com try/except
@@ -18,12 +27,14 @@ Requisitos:
 from __future__ import annotations
 
 import os
+import secrets
 import threading
 from typing import Any, Dict, Optional
 
 import jinja2
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import Depends, FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field, ValidationError
 from loguru import logger as log
 import uvicorn
@@ -74,6 +85,57 @@ def update_state(state: Dict[str, Any]) -> None:
 
 
 # ──────────────────────────────────────────────
+# Autenticação (FIX CRÍTICO — auditoria item 2)
+# ──────────────────────────────────────────────
+
+_security = HTTPBasic()
+
+
+def _verify_dashboard_auth(
+    credentials: HTTPBasicCredentials = Depends(_security),
+) -> str:
+    """
+    Dependency de autenticação HTTP Basic aplicada a TODAS as rotas
+    do dashboard.
+
+    Usa secrets.compare_digest() para comparação em tempo constante,
+    evitando timing attacks triviais na comparação de credenciais.
+
+    Raises:
+        HTTPException 503: se o bot ainda não inicializou _active_cfg.
+        HTTPException 401: se usuário/senha não conferem.
+
+    Returns:
+        str: Nome de usuário autenticado (para logging futuro, se
+            necessário).
+    """
+    if _active_cfg is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Config não disponível (bot não iniciado)",
+        )
+
+    expected_user = _active_cfg.dashboard.user
+    expected_pass = _active_cfg.dashboard.password
+
+    correct_user = secrets.compare_digest(credentials.username, expected_user)
+    correct_pass = secrets.compare_digest(credentials.password, expected_pass)
+
+    if not (correct_user and correct_pass):
+        log.warning(
+            f"[DASHBOARD] Tentativa de acesso NÃO AUTORIZADA "
+            f"(usuário informado: '{credentials.username}')"
+        )
+        raise HTTPException(
+            status_code=401,
+            detail="Credenciais inválidas",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    return credentials.username
+
+
+# ──────────────────────────────────────────────
 # Schema de edição de config (campos seguros para hot-reload)
 # ──────────────────────────────────────────────
 
@@ -92,17 +154,21 @@ class RiskUpdateRequest(BaseModel):
     daily_loss_limit_pct: Optional[float] = Field(None, ge=0.5, le=20.0)
     max_open_trades: Optional[int] = Field(None, ge=1, le=20)
     max_consecutive_losses: Optional[int] = Field(None, ge=1, le=10)
+    max_correlated_exposure_pct: Optional[float] = Field(None, ge=10.0, le=100.0)
     enabled_strategies: Optional[str] = None
 
 
 # ──────────────────────────────────────────────
-# Rotas — leitura
+# Rotas — leitura (autenticadas)
 # ──────────────────────────────────────────────
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request) -> HTMLResponse:
-    """Página principal do dashboard."""
+async def index(
+    request: Request,
+    _auth: str = Depends(_verify_dashboard_auth),
+) -> HTMLResponse:
+    """Página principal do dashboard (requer autenticação)."""
     html = _render_template(
         "index.html",
         request=request,
@@ -116,20 +182,24 @@ async def index(request: Request) -> HTMLResponse:
 
 
 @app.get("/api/health")
-async def health() -> Dict[str, Any]:
-    """Health check da API."""
+async def health(_auth: str = Depends(_verify_dashboard_auth)) -> Dict[str, Any]:
+    """Health check da API do dashboard (requer autenticação — expõe
+    posições e métricas, diferente de health_server.py:8081, que é
+    propositalmente público para probes de infra)."""
     return {"status": "ok", "state": _dashboard_state}
 
 
 @app.get("/api/metrics")
-async def metrics() -> Dict[str, Any]:
-    """Métricas em tempo real."""
+async def metrics(_auth: str = Depends(_verify_dashboard_auth)) -> Dict[str, Any]:
+    """Métricas em tempo real (requer autenticação)."""
     return _dashboard_state.get("metrics", {})
 
 
 @app.get("/api/config")
-async def get_config_endpoint() -> Dict[str, Any]:
-    """Retorna a configuração de risco ATUALMENTE em uso pelo bot."""
+async def get_config_endpoint(
+    _auth: str = Depends(_verify_dashboard_auth),
+) -> Dict[str, Any]:
+    """Retorna a configuração de risco ATUALMENTE em uso pelo bot (requer autenticação)."""
     if _active_cfg is None:
         raise HTTPException(status_code=503, detail="Config não disponível (bot não iniciado)")
     return {
@@ -139,21 +209,30 @@ async def get_config_endpoint() -> Dict[str, Any]:
 
 
 # ──────────────────────────────────────────────
-# Rota — escrita (item novo: torna save_json/load_json úteis de fato)
+# Rota — escrita (requer autenticação)
 # ──────────────────────────────────────────────
 
 
 @app.post("/api/config")
-async def update_config_endpoint(update: RiskUpdateRequest) -> JSONResponse:
+async def update_config_endpoint(
+    update: RiskUpdateRequest,
+    _auth: str = Depends(_verify_dashboard_auth),
+) -> JSONResponse:
     """
     Aplica alterações de risco em tempo real e persiste em bot_config.json.
 
+    FIX CRÍTICO (auditoria item 2): esta é a rota MAIS sensível do
+    sistema — permite alterar stop_loss, take_profit, drawdown máximo
+    e estratégias habilitadas em produção. Agora exige autenticação
+    (_verify_dashboard_auth) antes de processar qualquer alteração.
+
     Fluxo:
-    1. Valida os campos recebidos (Pydantic já rejeita fora de range).
-    2. Aplica em memória em _active_cfg.risk (efeito IMEDIATO no bot
+    1. Autentica via HTTP Basic (dependency acima).
+    2. Valida os campos recebidos (Pydantic já rejeita fora de range).
+    3. Aplica em memória em _active_cfg.risk (efeito IMEDIATO no bot
        ao vivo, sem restart — a próxima chamada de can_open()/calc_stops()
        já usa o novo valor).
-    3. Persiste em bot_config.json via BotConfig.save_json(), para que
+    4. Persiste em bot_config.json via BotConfig.save_json(), para que
        o valor sobreviva a um restart do processo.
 
     Campos não incluídos no request permanecem inalterados.
@@ -185,7 +264,7 @@ async def update_config_endpoint(update: RiskUpdateRequest) -> JSONResponse:
             # Persistir em disco para sobreviver a restart
             _active_cfg.save_json("bot_config.json")
 
-            log.info(f"[DASHBOARD] Config atualizada via API: {applied}")
+            log.info(f"[DASHBOARD] Config atualizada via API (user='{_auth}'): {applied}")
 
         return JSONResponse({"status": "applied", "updated_fields": applied}, status_code=200)
 
@@ -216,7 +295,8 @@ def start_dashboard_thread(cfg: BotConfig) -> Optional[threading.Thread]:
 
     Args:
         cfg: Configuração ativa do bot (será referenciada por
-            _active_cfg para leitura/escrita via /api/config).
+            _active_cfg para leitura/escrita via /api/config, e para
+            resolver as credenciais de autenticação do dashboard).
 
     Returns:
         Thread do servidor, ou None se dashboard_enabled=False ou erro.
@@ -228,6 +308,13 @@ def start_dashboard_thread(cfg: BotConfig) -> Optional[threading.Thread]:
             log.info("[DASHBOARD] Desabilitado via config (dashboard_enabled=false)")
             return None
 
+        if cfg.dashboard.password == "changeme":  # nosec - alerta operacional, não segredo
+            log.warning(
+                "[DASHBOARD] ATENÇÃO: senha padrão 'changeme' em uso para o "
+                "dashboard. Defina DASHBOARD_PASSWORD no .env antes de expor "
+                "esta porta para além de localhost, especialmente em mainnet."
+            )
+
         _active_cfg = cfg
 
         def _run() -> None:
@@ -235,7 +322,7 @@ def start_dashboard_thread(cfg: BotConfig) -> Optional[threading.Thread]:
                 log.info(
                     f"[DASHBOARD] Iniciando em "
                     f"http://{cfg.dashboard.host}:{cfg.dashboard.port} "
-                    f"(thread em background)"
+                    f"(thread em background, autenticação HTTP Basic ativa)"
                 )
                 uvicorn.run(
                     app,
@@ -263,7 +350,9 @@ def start_dashboard(cfg: BotConfig) -> None:
     use apenas para inspecionar a UI/rotas isoladamente, não para
     monitorar um bot ao vivo real).
     """
+    global _active_cfg
     try:
+        _active_cfg = cfg
         log.warning(
             "[DASHBOARD] Rodando em modo standalone (--mode dashboard). "
             "Este modo NÃO reflete o estado do bot ao vivo — para "

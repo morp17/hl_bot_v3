@@ -1,28 +1,56 @@
 """
 Módulo de Backtesting — Hyperliquid Production Bot v3.0
 =======================================================
-Engine de backtesting que reutiliza as 7 estratégias existentes,
+Engine de backtesting que reutiliza as 7+ estratégias existentes,
 o sistema de risco e os indicadores do bot real.
 
 Uso:
     from crypto_bot_core.backtest import BacktestEngine
 
     engine = BacktestEngine(cfg, initial_capital=10000.0)
-    result = engine.run(df)  # df com indicadores já calculados
+    result = engine.run(df, symbol="BTC/USDC")  # df com indicadores já calculados
 
     print(result.summary())
     result.export_csv("backtest_result.csv")
+
+    # Modo ensemble (combina todas as estratégias de enabled_strategies):
+    engine = BacktestEngine(cfg, ensemble_mode=True)
+    result = engine.run(df, symbol="BTC/USDC")
 
     # Walk-forward (validação de robustez temporal, sem reotimização
     # de parâmetros entre janelas):
     results = engine.run_walk_forward(df)
 
-Requisitos:
-- Type hints
-- Tratamento de exceções com try/except
-- Validação de inputs
-- Logs estruturados
-- Testes unitários em tests/test_backtest.py
+FIX (achado em uso real — símbolo incorreto no resultado): por padrão,
+BacktestEngine agora IGNORA o gate de cfg.enabled_strategies ao gerar
+sinais (bypass_enabled_strategies=True por default). Motivo: o próprio
+propósito do backtest é validar uma estratégia ANTES de liberá-la para
+operar ao vivo via ENABLED_STRATEGIES — com o gate ativo por padrão no
+backtest, testar qualquer estratégia fora da lista padrão sempre
+resultava em total_trades=0 silenciosamente, e gerava um WARNING por
+barra processada (spam de milhares de linhas em backtests longos).
+
+Se você quer simular EXATAMENTE o que aconteceria em produção com o
+.env atual (ou seja, respeitando o bloqueio de estratégias não
+habilitadas), instancie com bypass_enabled_strategies=False.
+
+Suporta também o modo ENSEMBLE (ensemble_mode=True), que usa
+get_ensemble_signal() em vez de get_signal() — combina todas as
+estratégias de cfg.enabled_strategies ponderadas por confiança,
+permitindo validar via dados históricos o comportamento que
+ENSEMBLE_MODE=true teria em produção, sem precisar alterar o .env.
+
+FIX (achado em uso real — item de bug reportado pelo usuário):
+BacktestResult.symbol antes SEMPRE usava
+self.cfg.symbols.split(",")[0].strip() — o primeiro símbolo da lista
+SYMBOLS do .env — independentemente de qual símbolo foi de fato
+buscado/testado (ex: via `python main.py --mode backtest --symbol
+ETH/USDC`). Rodar o backtest para qualquer símbolo diferente do
+primeiro da lista exibia o símbolo ERRADO no summary/CSV. Corrigido:
+run() agora aceita um parâmetro `symbol` explícito, propagado por
+main.py::_run_backtest(). Mantém fallback para o comportamento antigo
+quando `symbol` não é informado, por compatibilidade com chamadores
+existentes (ex: alguns testes).
 
 NOTA METODOLÓGICA (ver auditoria — itens 6 e 7):
 - Slippage é aplicado tanto na entrada quanto na saída (config
@@ -38,6 +66,13 @@ NOTA METODOLÓGICA (ver auditoria — itens 6 e 7):
   roda cada uma isoladamente, SEM reotimizar STRATEGY_DEFAULTS por
   janela — é uma checagem de robustez/consistência temporal, não uma
   walk-forward optimization completa.
+
+Requisitos:
+- Type hints
+- Tratamento de exceções com try/except
+- Validação de inputs
+- Logs estruturados
+- Testes unitários em tests/test_backtest.py, tests/test_backtest_gate.py
 """
 
 from __future__ import annotations
@@ -51,7 +86,7 @@ from loguru import logger as log
 
 from .config import BotConfig
 from .risk import calc_position_size, calc_stops
-from .strategies.signals import get_signal
+from .strategies.signals import get_ensemble_signal, get_signal
 
 
 # ──────────────────────────────────────────────
@@ -102,8 +137,8 @@ class BacktestResult:
     """Resultado completo de uma execução de backtest.
 
     Attributes:
-        strategy: Nome da estratégia utilizada.
-        symbol: Símbolo testado.
+        strategy: Nome da estratégia utilizada (ou "ensemble").
+        symbol: Símbolo efetivamente testado.
         timeframe: Timeframe dos dados.
         start_date: Data de início da simulação.
         end_date: Data de fim da simulação.
@@ -287,12 +322,20 @@ class BacktestResult:
 class BacktestEngine:
     """Engine de backtesting.
 
-    Simula a execução de uma estratégia sobre dados históricos OHLCV,
-    respeitando as mesmas regras de risco do bot real.
+    Simula a execução de uma estratégia (ou do ensemble de estratégias)
+    sobre dados históricos OHLCV, respeitando as mesmas regras de risco
+    do bot real.
 
     Attributes:
         cfg: Configuração do bot.
         initial_capital: Capital inicial para a simulação.
+        bypass_enabled_strategies: Se True (default), a estratégia
+            configurada em cfg.strategy é executada mesmo que não
+            esteja em cfg.enabled_strategies (modo single-strategy
+            apenas — não se aplica em modo ensemble).
+        ensemble_mode: Se True, usa get_ensemble_signal() em vez de
+            get_signal() — combina todas as estratégias de
+            cfg.enabled_strategies ponderadas por confiança.
     """
 
     # Mapeamento de timeframe para minutos (para anualização do Sharpe)
@@ -306,32 +349,95 @@ class BacktestEngine:
         "1d": 1440,
     }
 
-    def __init__(self, cfg: BotConfig, initial_capital: float = 10000.0) -> None:
+    def __init__(
+        self,
+        cfg: BotConfig,
+        initial_capital: float = 10000.0,
+        bypass_enabled_strategies: bool = True,
+        ensemble_mode: bool = False,
+    ) -> None:
         """Inicializa o BacktestEngine.
 
         Args:
             cfg: Configuração do bot.
             initial_capital: Capital inicial para o backtest.
+            bypass_enabled_strategies: Se True (default), ignora o
+                gate de cfg.enabled_strategies — a estratégia
+                configurada em cfg.strategy sempre executa sua lógica
+                real de sinal, independente de estar habilitada para
+                live. Defina False para simular fielmente o
+                comportamento que ocorreria em produção com o .env
+                atual (estratégias não habilitadas retornam hold em
+                toda barra). Não se aplica quando ensemble_mode=True
+                (o ensemble usa enabled_strategies como lista de
+                participantes, sem gate de bloqueio adicional).
+            ensemble_mode: Se True, usa get_ensemble_signal() em vez
+                de get_signal() — combina todas as estratégias de
+                cfg.enabled_strategies ponderadas por confiança,
+                exigindo confluência mínima (cfg.ensemble_min_confluence)
+                e confiança média mínima (cfg.ensemble_min_avg_confidence)
+                antes de emitir buy/sell. Permite validar via backtest
+                o comportamento que ENSEMBLE_MODE=true teria em
+                produção, sem precisar alterar o .env. Default False
+                (mantém o comportamento single-strategy pré-existente).
 
         Raises:
-            ValueError: Se a estratégia não for suportada.
+            ValueError: Se a estratégia não for suportada (verificado
+                apenas quando ensemble_mode=False).
         """
         try:
             self.cfg = cfg
             self.initial_capital = initial_capital
-            self._validate_config()
+            self.bypass_enabled_strategies = bypass_enabled_strategies
+            self.ensemble_mode = ensemble_mode
+
+            if not ensemble_mode:
+                self._validate_config()
+
+                if not cfg.is_strategy_enabled() and bypass_enabled_strategies:
+                    log.info(
+                        f"[BACKTEST] Estratégia '{cfg.strategy.value}' NÃO está em "
+                        f"enabled_strategies ('{cfg.enabled_strategies}'), mas "
+                        f"bypass_enabled_strategies=True (default) — o backtest "
+                        f"executará a lógica real da estratégia mesmo assim, "
+                        f"pois este é justamente o mecanismo de validação "
+                        f"walk-forward que precede a habilitação em produção."
+                    )
+                elif not cfg.is_strategy_enabled() and not bypass_enabled_strategies:
+                    log.warning(
+                        f"[BACKTEST] Estratégia '{cfg.strategy.value}' NÃO está em "
+                        f"enabled_strategies e bypass_enabled_strategies=False — "
+                        f"o backtest retornará hold em TODAS as barras, resultando "
+                        f"em total_trades=0. Isso simula fielmente o comportamento "
+                        f"em produção com o .env atual."
+                    )
+            else:
+                log.info(
+                    f"[BACKTEST] Modo ENSEMBLE: combinando estratégias "
+                    f"'{cfg.enabled_strategies}' (min_confluencia="
+                    f"{cfg.ensemble_min_confluence}, min_confianca_media="
+                    f"{cfg.ensemble_min_avg_confidence:.2f}). "
+                    f"bypass_enabled_strategies não se aplica neste modo — "
+                    f"enabled_strategies já funciona como lista de "
+                    f"participantes do ensemble, sem gate de bloqueio "
+                    f"adicional."
+                )
+
             log.info(
                 f"[BACKTEST] Engine inicializado: "
-                f"estratégia={cfg.strategy.value}, "
+                f"estratégia={'ensemble' if ensemble_mode else cfg.strategy.value}, "
                 f"timeframe={cfg.timeframe.value}, "
-                f"capital={initial_capital:.2f}"
+                f"capital={initial_capital:.2f}, "
+                f"bypass_enabled_strategies={bypass_enabled_strategies}, "
+                f"ensemble_mode={ensemble_mode}"
             )
         except Exception as e:
             log.error(f"[BACKTEST] Erro ao inicializar engine: {e}")
             raise
 
     def _validate_config(self) -> None:
-        """Valida se a configuração é compatível com backtest.
+        """Valida se a configuração é compatível com backtest (modo
+        single-strategy apenas — não chamado em modo ensemble).
 
         Raises:
             ValueError: Se a estratégia não for reconhecida.
@@ -344,6 +450,8 @@ class BacktestEngine:
             "orderflow_delta",
             "scalping_grid",
             "funding_arbitrage",
+            "volatility_squeeze",
+            "funding_weighted_trend",
         }
 
         strategy_name = self.cfg.strategy.value
@@ -361,7 +469,7 @@ class BacktestEngine:
         """
         return self.TF_MINUTES_MAP.get(self.cfg.timeframe.value, 60)
 
-    def run(self, df: pd.DataFrame) -> BacktestResult:
+    def run(self, df: pd.DataFrame, symbol: Optional[str] = None) -> BacktestResult:
         """Executa o backtest sobre o DataFrame com indicadores.
 
         O DataFrame deve conter colunas OHLCV (open, high, low, close, volume)
@@ -369,6 +477,19 @@ class BacktestEngine:
 
         Args:
             df: DataFrame com colunas OHLCV + indicadores.
+            symbol: Símbolo efetivamente testado (ex: "ETH/USDC"), usado
+                para popular BacktestResult.symbol corretamente. Se
+                None, cai no fallback legado (primeiro símbolo de
+                cfg.symbols) — mantido por compatibilidade com
+                chamadores que não passam este argumento (ex: alguns
+                testes existentes).
+
+                FIX (achado em uso real): antes, BacktestResult.symbol
+                sempre usava self.cfg.symbols.split(",")[0], ignorando
+                qual símbolo foi de fato buscado via --symbol em
+                main.py — rodar `--symbol ETH/USDC` exibia "BTC/USDC"
+                no summary/CSV sempre que SYMBOLS no .env tivesse
+                BTC/USDC como primeiro item da lista.
 
         Returns:
             BacktestResult com todos os trades e métricas.
@@ -392,7 +513,8 @@ class BacktestEngine:
                 )
 
             log.info(
-                f"[BACKTEST] Iniciando {self.cfg.strategy.value} @ "
+                f"[BACKTEST] Iniciando "
+                f"{'ensemble' if self.ensemble_mode else self.cfg.strategy.value} @ "
                 f"{self.cfg.timeframe.value} — {len(df)} velas"
             )
 
@@ -537,7 +659,22 @@ class BacktestEngine:
                         )
 
                         if not has_position and len(positions) < self.cfg.risk.max_open_trades:
-                            signal, params = get_signal(bar, self.cfg)
+                            # FIX (suporte a ensemble_mode): usa
+                            # get_ensemble_signal() quando o modo ensemble
+                            # está ativo, propagando o mesmo comportamento
+                            # de agregação/confluência que main.py usaria
+                            # em produção com ENSEMBLE_MODE=true. Caso
+                            # contrário, mantém get_signal() single-strategy
+                            # com o bypass de enabled_strategies conforme
+                            # configurado no construtor.
+                            if self.ensemble_mode:
+                                signal, params = get_ensemble_signal(bar, self.cfg)
+                            else:
+                                signal, params = get_signal(
+                                    bar,
+                                    self.cfg,
+                                    enforce_enabled_gate=not self.bypass_enabled_strategies,
+                                )
 
                             if signal in ("buy", "sell"):
                                 sl, tp = calc_stops(
@@ -587,7 +724,8 @@ class BacktestEngine:
 
                                     log.debug(
                                         f"[BACKTEST] Entrada {signal.upper()} @ {fill_entry_price:.2f} "
-                                        f"(raw={price:.2f}) qty={qty:.6f} SL={sl:.2f} TP={tp:.2f}"
+                                        f"(raw={price:.2f}) qty={qty:.6f} SL={sl:.2f} TP={tp:.2f} "
+                                        f"conf={params.get('confidence', 0.0):.2f}"
                                     )
                     except Exception as e:
                         log.error(
@@ -688,9 +826,17 @@ class BacktestEngine:
                             np.mean(returns) / np.std(returns) * annualization_factor
                         )
 
+                # FIX (achado em uso real): usa o símbolo explicitamente
+                # passado a run() quando disponível — antes sempre caía
+                # no fallback (primeiro símbolo de cfg.symbols),
+                # independentemente do símbolo realmente testado.
+                effective_symbol = symbol or (
+                    self.cfg.symbols.split(",")[0].strip() if self.cfg.symbols else "UNKNOWN"
+                )
+
                 result = BacktestResult(
-                    strategy=self.cfg.strategy.value,
-                    symbol=self.cfg.symbols.split(",")[0].strip() if self.cfg.symbols else "UNKNOWN",
+                    strategy="ensemble" if self.ensemble_mode else self.cfg.strategy.value,
+                    symbol=effective_symbol,
                     timeframe=self.cfg.timeframe.value,
                     start_date=str(df.index[start_idx]),
                     end_date=str(df.index[-1]),
@@ -735,7 +881,7 @@ class BacktestEngine:
             raise
 
     def run_walk_forward(
-        self, df: pd.DataFrame, windows: Optional[int] = None
+        self, df: pd.DataFrame, windows: Optional[int] = None, symbol: Optional[str] = None
     ) -> List[BacktestResult]:
         """
         Executa walk-forward validation: particiona df em N janelas
@@ -760,6 +906,9 @@ class BacktestEngine:
             df: DataFrame completo com indicadores já calculados.
             windows: Número de janelas (default:
                 cfg.backtest.walk_forward_windows).
+            symbol: Símbolo efetivamente testado, propagado para cada
+                BacktestResult de janela (ver run()). Se None, usa o
+                fallback legado.
 
         Returns:
             List[BacktestResult]: um resultado por janela processada
@@ -811,7 +960,7 @@ class BacktestEngine:
                 )
 
                 try:
-                    result = self.run(window_df)
+                    result = self.run(window_df, symbol=symbol)
                     results.append(result)
                     log.info(
                         f"[WALK-FORWARD] Janela {w + 1}/{n_windows} concluída: "
